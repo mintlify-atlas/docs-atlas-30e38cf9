@@ -69,12 +69,17 @@ The singleton engine is created once at startup by `get_engine()` in `src/core/d
 | `pool_pre_ping` | `true` | Issues `SELECT 1` before each checkout to evict stale connections |
 
 ```python src/core/database.py
+_POOL_SIZE: int = 5
+_POOL_OVERFLOW: int = 5
+_POOL_RECYCLE_SECS: int = 295
+_POOL_TIMEOUT_SECS: int = 15
+
 _engine = create_async_engine(
     settings.database_url,
-    pool_size=5,
-    max_overflow=5,
-    pool_timeout=15,
-    pool_recycle=295,
+    pool_size=_POOL_SIZE,
+    max_overflow=_POOL_OVERFLOW,
+    pool_timeout=_POOL_TIMEOUT_SECS,
+    pool_recycle=_POOL_RECYCLE_SECS,
     pool_pre_ping=True,
     connect_args={"connect_timeout": settings.db_connect_timeout},
     echo=settings.log_level == "DEBUG",

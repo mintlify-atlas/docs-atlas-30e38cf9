@@ -1,7 +1,7 @@
 ---
-title: "Chat API — POST /chat, GET /health, GET /metrics"
+title: "Chat API — POST /chat, POST /api/upload, GET /health"
 sidebarTitle: "Chat REST API"
-description: "POST natural language questions to the ERP Financial Agent, handle HITL confirmation flows, and check service health and Prometheus metrics."
+description: "POST natural language questions, upload Excel/CSV files for ad-hoc analysis, handle HITL confirmation flows, and check service health."
 ---
 
 The REST Chat API is the synchronous interface to the ERP Financial Agent pipeline. Each `POST /chat` request runs the full LangGraph pipeline — schema linking, SQL generation, execution, and analysis — and returns a complete structured response. For streaming progress events while the pipeline runs, use the [WebSocket API](/api/websocket) instead.
@@ -270,6 +270,101 @@ asyncio.run(main())
 ```
 
 </CodeGroup>
+
+---
+
+## POST /api/upload
+
+Upload an Excel (`.xlsx`, `.xls`) or CSV file for ad-hoc analysis. The endpoint validates the file, parses it with pandas, and stores the result in Redis keyed by a generated `file_id`. Pass the returned `file_id` in a subsequent WebSocket `chat` message (via the `file_id` field) to route that turn through the `analyze_file` pipeline node.
+
+Requires the `file.upload` permission (granted to `finance_lead` and above by default).
+
+### Request
+
+`multipart/form-data` with the following fields:
+
+<ParamField body="file" type="file" required>
+  The Excel or CSV file to upload. Accepted extensions: `.xlsx`, `.xls`, `.csv`. Maximum size is controlled by the `MAX_UPLOAD_SIZE_MB` environment variable.
+</ParamField>
+
+<ParamField body="session_id" type="string">
+  Active session ID to associate the file with. When omitted, a new UUID session is created. The resolved session ID is always returned in the response.
+</ParamField>
+
+### Response — `FileUploadResponse`
+
+<ResponseField name="file_id" type="string" required>
+  UUID identifying this upload in Redis. Pass this value as `file_id` in the next WebSocket `chat` message.
+</ResponseField>
+
+<ResponseField name="session_id" type="string" required>
+  Session the file was associated with (either the provided value or a newly generated UUID).
+</ResponseField>
+
+<ResponseField name="filename" type="string" required>
+  Original filename as received from the client.
+</ResponseField>
+
+<ResponseField name="columns" type="array" required>
+  List of column metadata objects parsed from the file.
+
+  <Expandable title="FileColumn fields">
+    <ResponseField name="name" type="string" required>Column name.</ResponseField>
+    <ResponseField name="dtype" type="string" required>pandas dtype string (e.g. `int64`, `object`, `float64`).</ResponseField>
+    <ResponseField name="sample_values" type="array">Up to 5 representative values from the column.</ResponseField>
+    <ResponseField name="null_count" type="integer">Number of null cells in the column.</ResponseField>
+    <ResponseField name="stats" type="object">Basic descriptive statistics (min, max, mean, etc.) for numeric columns.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="row_count" type="integer" required>
+  Number of data rows in the uploaded file (excluding the header row).
+</ResponseField>
+
+<ResponseField name="preview" type="array" required>
+  First 5 rows of the file as an array of objects, useful for previewing content in the UI before querying.
+</ResponseField>
+
+<ResponseField name="file_size_bytes" type="integer" required>
+  Size of the uploaded file in bytes.
+</ResponseField>
+
+### Error Responses
+
+| Status | Condition |
+|--------|-----------|
+| `400 Bad Request` | Unsupported file extension or parse failure. |
+| `401 Unauthorized` | Missing or invalid JWT. |
+| `403 Forbidden` | Caller lacks the `file.upload` permission. |
+| `413 Request Entity Too Large` | File exceeds the configured `MAX_UPLOAD_SIZE_MB` limit. |
+| `429 Too Many Requests` | Rate limit exceeded (10 req / minute). |
+
+### Example
+
+```bash cURL
+curl -X POST https://api.example.com/api/upload \
+  -H "Authorization: Bearer $COGNITO_TOKEN" \
+  -F "file=@ventas_q1.xlsx" \
+  -F "session_id=session-abc123"
+```
+
+```json Response
+{
+  "file_id": "f7c2e1a0-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+  "session_id": "session-abc123",
+  "filename": "ventas_q1.xlsx",
+  "columns": [
+    { "name": "fecha", "dtype": "object", "sample_values": ["2024-01-01"], "null_count": 0, "stats": {} },
+    { "name": "monto", "dtype": "float64", "sample_values": ["15000.00"], "null_count": 2, "stats": { "min": 100.0, "max": 95000.0, "mean": 18450.5 } }
+  ],
+  "row_count": 1240,
+  "preview": [
+    { "fecha": "2024-01-01", "monto": 15000.0 },
+    { "fecha": "2024-01-02", "monto": 22400.5 }
+  ],
+  "file_size_bytes": 48320
+}
+```
 
 ---
 

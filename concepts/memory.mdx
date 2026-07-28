@@ -1,7 +1,7 @@
 ---
 title: "Memory Architecture: Redis Sessions and DynamoDB History"
 sidebarTitle: "Memory"
-description: "How the ERP agent combines Redis short-term session memory with DynamoDB long-term conversation history to give Claude cross-turn and cross-session context."
+description: "How the ERP agent uses Redis for active session memory and DynamoDB for 90-day conversation history, giving Claude cross-turn and cross-session context."
 ---
 
 The ERP Financial Agent uses a two-tier memory architecture. **Redis** holds the hot, ephemeral state of each active conversation — messages, uploaded file data, and checkpoint blobs for the clarification loop. **DynamoDB** stores compressed session summaries that persist for 90 days and are injected back into Claude's context window at the start of every new session as a `session_digest`.
@@ -40,13 +40,20 @@ The ERP Financial Agent uses a two-tier memory architecture. **Redis** holds the
 
 ### Session Keys
 
+`SessionStore` (`src/core/sessions.py`) owns the following Redis keys:
+
 | Key pattern | TTL | Contents |
 |---|---|---|
 | `session:{session_id}` | `SESSION_TTL_MINUTES × 60 s` | Full `Session` object serialized as JSON — messages, timestamps, metadata |
 | `file:{session_id}:{file_id}` | `file_data_ttl_minutes × 60 s` | Parsed Excel/CSV payload (rows + metadata) |
 | `file:active:{session_id}` | `file_data_ttl_minutes × 60 s` | UUID of the most-recently uploaded file |
 | `checkpoint:{session_id}` | `redis_ttl_minutes × 60 s` | LangGraph state snapshot for clarification loop resume |
-| `schema:metadata` | 3600 s | Serialized `INFORMATION_SCHEMA` table/column cache |
+
+`SchemaMetadataReader` (`src/schema_registry/schema_metadata.py`) owns these additional Redis keys:
+
+| Key pattern | TTL | Contents |
+|---|---|---|
+| `schema:metadata` | 3600 s | Serialized `INFORMATION_SCHEMA` table/column cache — shared across ECS tasks to avoid redundant DB round-trips on cold start |
 | `schema:summary` | 3600 s | Pre-built ~1500-token schema summary for the `understand` node |
 
 ### Configuration
@@ -136,7 +143,7 @@ await save_session_summary(
 
 ### Cross-Session History Load
 
-At the start of each new conversation, the agent fetches up to 10 recent session summaries for the user and builds a `session_digest` string:
+At the start of each new conversation, the agent fetches up to 10 recent session summaries for the user. `build_cross_session_context()` then formats the most recent 5 of those into a compact `session_digest` string:
 
 ```python
 history = await get_user_history(user_id, limit=10)
@@ -197,13 +204,13 @@ The digest tracks:
 
 ## Cost Tracker Persistence
 
-Per-session LLM cost tracking (token counts, estimated USD cost) is persisted with a **Redis-first, DynamoDB fallback** strategy:
+Per-session LLM cost tracking (token counts, estimated USD cost) is persisted with a **dual-write** strategy: after each LLM call, the `CostTracker` singleton schedules fire-and-forget writes to **both** Redis and DynamoDB in parallel.
 
-1. After each node execution, cost data is written to `session:{session_id}` metadata in Redis.
-2. When the session ends, the aggregated cost is included in the DynamoDB session summary.
-3. If Redis is unavailable, the cost data falls back to DynamoDB directly.
+- **Save path:** `save_to_redis()` and `save_to_dynamodb()` are called concurrently via `loop.create_task()` on every recorded call. Neither is a fallback for the other — both writes happen regardless.
+- **Restore path (startup only):** Redis is tried first; DynamoDB is only consulted if Redis returns nothing. This startup sequence is Redis-first with DynamoDB fallback.
+- Redis key: `cost:tracker` with a 90-day TTL. DynamoDB key: `user_id="SYSTEM"`, `session_id="cost_tracker"` in the `erp-agent-conversations` table (no TTL — permanent backup).
 
-This ensures cost visibility survives Redis eviction under memory pressure.
+This dual-write ensures cost data survives Redis eviction or redeployment without loss.
 
 ---
 

@@ -27,7 +27,7 @@ No query parameters or subprotocols are required for the initial HTTP upgrade.
 
 WebSocket connections cannot carry an `Authorization` HTTP header after the initial upgrade in most browser environments, so authentication is performed as the **first message** on the socket.
 
-The server enforces a **10-second timeout** (`AUTH_TIMEOUT_SECONDS = 10`). If the auth message is not received within that window the server sends an `error` event with `error_code: "AUTH_TIMEOUT"` and closes the connection.
+The server enforces a **10-second timeout** (`_AUTH_TIMEOUT_SECONDS = 10`). If the auth message is not received within that window the server sends an `error` event with `error_code: "AUTH_TIMEOUT"` and closes the connection.
 
 <Steps>
   <Step title="Connect">
@@ -89,7 +89,7 @@ Send a natural language question to the agent pipeline.
 </ParamField>
 
 <ParamField body="file_id" type="string">
-  Optional ID of a previously uploaded file (from `POST /upload`). When provided the pipeline routes the turn through the `analyze_file` node.
+  Optional ID of a previously uploaded file (from `POST /api/upload`). When provided the pipeline routes the turn through the `analyze_file` node.
 </ParamField>
 
 ```json
@@ -165,7 +165,7 @@ Emitted when the pipeline enters a processing node. Use this to drive progress i
 </ResponseField>
 
 <ResponseField name="label" type="string">
-  Human-readable Spanish label suitable for display in a loading state.
+  Human-readable Spanish label suitable for display in a loading state. Present only when the outer conversation graph path is active. In the legacy single-graph path this field is omitted — always guard with an existence check before reading.
 </ResponseField>
 
 <ResponseField name="timestamp" type="string">

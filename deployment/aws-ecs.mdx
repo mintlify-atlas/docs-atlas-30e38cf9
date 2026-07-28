@@ -1,7 +1,7 @@
 ---
-title: "AWS ECS Fargate Deployment Guide"
+title: "AWS ECS Fargate Deployment for ERP Financial Agent"
 sidebarTitle: "AWS ECS"
-description: "Deploy ERP Financial Agent to AWS ECS Fargate using three CloudFormation stacks: network, services, and CI/CD. Includes ALB, ECR, auto-scaling, and GitHub Actions."
+description: "Deploy the ERP Financial Agent on AWS ECS Fargate. CloudFormation manages the network, services, and CI/CD IAM role. GitHub Actions automates deploys."
 ---
 
 The ERP Financial Agent runs on AWS ECS Fargate behind an Application Load Balancer. Three CloudFormation stacks describe the full infrastructure: the network layer (VPC, subnets, NAT), the services layer (ECS cluster, task definitions, ALB, ECR, ElastiCache, DynamoDB), and the CI/CD layer (GitHub OIDC provider and the IAM role that GitHub Actions assumes). A `deploy.sh` script ties them together for an initial rollout; subsequent deployments are fully automated via GitHub Actions.
@@ -103,9 +103,17 @@ The ALB sits in two public subnets across two availability zones for high availa
     This creates the `erp-agent-network` stack. Wait for the stack to reach `CREATE_COMPLETE` before proceeding — the services stack imports its outputs.
   </Step>
 
-  <Step title="Build and push Docker images to ECR">
-    After the services stack is deployed (step 4), ECR repositories will exist. You can also push manually before the first ECS deploy:
+  <Step title="Deploy the services stack">
+    ```bash
+    DB_PASSWORD="your-database-password" ./deploy.sh services
+    ```
 
+    The script prompts for `DB_PASSWORD` if the environment variable is not set. The password is stored in Secrets Manager as `erp-agent/db-password` and injected into the ECS task at runtime — it never appears in plaintext in the task definition.
+
+    This step creates the ECR repositories (`erp-agent/backend` and `erp-agent/frontend`) that you will push images to in the next step.
+  </Step>
+
+  <Step title="Build and push Docker images to ECR">
     ```bash
     # Authenticate to ECR
     aws ecr get-login-password --region us-east-1 | \
@@ -126,14 +134,6 @@ The ALB sits in two public subnets across two availability zones for high availa
     docker push \
       <account-id>.dkr.ecr.us-east-1.amazonaws.com/erp-agent/frontend:latest
     ```
-  </Step>
-
-  <Step title="Deploy the services stack">
-    ```bash
-    DB_PASSWORD="your-database-password" ./deploy.sh services
-    ```
-
-    The script prompts for `DB_PASSWORD` if the environment variable is not set. The password is stored in Secrets Manager as `erp-agent/db-password` and injected into the ECS task at runtime — it never appears in plaintext in the task definition.
   </Step>
 
   <Step title="Deploy the CI/CD stack">
@@ -216,6 +216,8 @@ The task definition injects the following environment variables into the `backen
 | `BEDROCK_REASONING_MODEL_ID` | Hardcoded in template | `us.anthropic.claude-sonnet-5` |
 | `BEDROCK_EMBEDDING_MODEL_ID` | Hardcoded in template | `amazon.titan-embed-text-v2:0` |
 | `DYNAMODB_ENABLED` | Hardcoded | `true` |
+| `EXPORTS_BUCKET_NAME` | S3 bucket from `ExportsBucket` output | `erp-agent-exports-<account-id>` |
+| `ENVIRONMENT` | CloudFormation parameter | `production` |
 | `EXPECTED_TENANT` | CloudFormation parameter | `*` (primary) or tenant slug |
 | `RBAC_ENFORCE` | CloudFormation parameter | `false` |
 | `LOG_LEVEL` | Hardcoded | `INFO` |

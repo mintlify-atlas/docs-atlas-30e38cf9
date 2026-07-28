@@ -1,7 +1,7 @@
 ---
 title: "Schema Registry: Connecting Questions to ERP Tables"
 sidebarTitle: "Schema Registry"
-description: "How the schema registry uses FAISS vector search, YAML catalogs, and a MetricsRegistry to map natural language questions to the right ERP tables and columns."
+description: "How the schema registry uses FAISS vector search, YAML catalogs, and a MetricsRegistry to route natural language questions to the right ERP tables."
 ---
 
 The Schema Registry is the intelligence layer that bridges natural language questions and MySQL query generation. Rather than forcing users to know table names, the registry uses semantic vector search to find the most relevant ERP tables, enriches them with curated business rules and join hints, and supplies pre-defined KPI formulas — so the SQL generator receives precise, trustworthy context on every request.
@@ -227,9 +227,9 @@ METRIC_SYNONYMS = {
 
 ## YAML Schemas and CatalogFromYaml
 
-In addition to the programmatic `DomainCatalog`, the registry supports **60+ ERP tables** documented in YAML files under the `yaml_schemas/` directory. When `use_generated_schema_catalog=True` (the preferred setting), `CatalogFromYaml` builds the full domain catalog from these YAML files at startup, replacing the hardcoded Python catalog.
+In addition to the programmatic `DomainCatalog`, the registry supports **60+ ERP tables** documented in YAML files under the `yaml_schemas/` directory. When `use_generated_schema_catalog=True` (the default), `catalog_from_yaml` is preferred over the hardcoded `domain_catalog.py` for every table it covers (53 of 65 tables as of 2026-07-09). Tables not yet covered by a YAML file fall back to the Python catalog automatically — the setting controls preference, not a complete replacement.
 
-This allows schema updates (new tables, column renames, new join hints) to be made in YAML without modifying Python code.
+This allows schema updates (new tables, column renames, new join hints) to be made in YAML without modifying Python code. Setting `use_generated_schema_catalog=False` is an instant rollback to the Python catalog if a covered table misbehaves.
 
 ---
 

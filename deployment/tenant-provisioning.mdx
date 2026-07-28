@@ -1,7 +1,7 @@
 ---
-title: "Multi-Tenant Provisioning and Management"
+title: "ERP Financial Agent Tenant Provisioning and Management"
 sidebarTitle: "Tenant Provisioning"
-description: "Provision isolated ERP Agent tenants with dedicated RDS, ECS service, and Cognito group using GitHub Actions workflow_dispatch or the admin panel API."
+description: "Provision a new tenant with a dedicated RDS MySQL instance, isolated ECS stack, and Cognito admin user using the GitHub Actions workflow dispatch."
 ---
 
 The ERP Financial Agent is designed as a multi-tenant SaaS product. Each client (tenant) gets a fully isolated deployment: a dedicated MySQL RDS instance, a dedicated ECS service running inside its own CloudFormation stack, and a Cognito user group scoped to that tenant. The primary instance — identified by `EXPECTED_TENANT=*` — serves internal users and hosts the admin panel. Tenant instances have `EXPECTED_TENANT` set to the tenant's slug, so only users with a matching `custom:tenantId` Cognito attribute can connect.

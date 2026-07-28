@@ -20,10 +20,6 @@ These fields have no default value. The application **will not start** without t
   Hostname of the MySQL database server. For AWS RDS use the full endpoint, e.g. `iafinagent.choi0eaq2mr7.us-east-1.rds.amazonaws.com`.
 </ParamField>
 
-<ParamField path="DB_PORT" type="integer" default="3306">
-  MySQL port. Change only if your RDS instance is on a non-standard port.
-</ParamField>
-
 <ParamField path="DB_NAME" type="string" required>
   Target database (schema) name. The default database used in the CloudFormation stack is `iafinagent`.
 </ParamField>
@@ -48,6 +44,10 @@ These fields have no default value. The application **will not start** without t
   AWS region where Bedrock, Cognito, DynamoDB, and Secrets Manager resources live. Cross-region inference profiles (`us.anthropic.*`) require this to be `us-east-1`.
 </ParamField>
 
+<ParamField path="AWS_ACCOUNT_ID" type="string">
+  Optional. Your 12-digit AWS account ID. Required by some IAM resource ARN constructions and tenant-panel features. When running on ECS the value is available from instance metadata.
+</ParamField>
+
 <ParamField path="BEDROCK_MODEL_ID" type="string" default="us.anthropic.claude-sonnet-4-5-20250929-v1:0">
   Bedrock cross-region inference profile used for general LLM calls (intent classification, SQL generation, explanations). Must be a valid inference profile ID, not a base model ID.
 </ParamField>
@@ -60,12 +60,28 @@ These fields have no default value. The application **will not start** without t
   Bedrock model for generating text embeddings (FAISS schema registry, semantic search). Produces 1024-dimensional vectors by default (`EMBEDDING_DIMENSIONS`).
 </ParamField>
 
-<ParamField path="AWS_ACCOUNT_ID" type="string">
-  Optional. Your 12-digit AWS account ID. Required by some IAM resource ARN constructions and tenant-panel features. When running on ECS the value is available from instance metadata.
-</ParamField>
-
 <ParamField path="DB_PASSWORD_SECRET_ARN" type="string">
   Optional. Full ARN of the Secrets Manager secret that stores the database password, e.g. `arn:aws:secretsmanager:us-east-1:123456789012:secret:erp-agent/db-password`. When set, `resolve_secrets()` fetches the real password at startup and injects it into `DB_PASSWORD`. Leave unset for local development.
+</ParamField>
+
+---
+
+## Database connection
+
+<ParamField path="DB_PORT" type="integer" default="3306">
+  MySQL port. Change only if your RDS instance is on a non-standard port.
+</ParamField>
+
+<ParamField path="DB_CONNECT_TIMEOUT" type="integer" default="10">
+  TCP handshake and authentication timeout in seconds. Passed as `connect_timeout` in `connect_args` to `aiomysql`.
+</ParamField>
+
+<ParamField path="DB_READ_TIMEOUT" type="integer" default="30">
+  Per-read timeout in seconds. Controls how long the driver waits for data from the server on a single network read.
+</ParamField>
+
+<ParamField path="DB_WRITE_TIMEOUT" type="integer" default="30">
+  Per-write timeout in seconds. Applies to write operations (relevant if the application is extended beyond read-only access in future).
 </ParamField>
 
 ---
@@ -73,7 +89,7 @@ These fields have no default value. The application **will not start** without t
 ## Session / Cache
 
 <ParamField path="REDIS_URL" type="string" default="redis://localhost:6379/0">
-  Full Redis connection URL. In the ECS deployment this is derived automatically from the ElastiCache cluster endpoint: `redis://<cluster-endpoint>:6379/0`.
+  Full Redis connection URL. In the ECS deployment this is derived from the ElastiCache cluster endpoint: `redis://<cluster-endpoint>:6379/0`.
 </ParamField>
 
 <ParamField path="REDIS_TTL_MINUTES" type="integer" default="30">
@@ -81,7 +97,7 @@ These fields have no default value. The application **will not start** without t
 </ParamField>
 
 <ParamField path="SESSION_TTL_MINUTES" type="integer" default="30">
-  How long an idle conversation session is kept alive. Counted from the last message in the session.
+  How long an idle conversation session is kept alive, counted from the last message in the session.
 </ParamField>
 
 <ParamField path="SESSION_MAX_MESSAGES" type="integer" default="100">
@@ -96,12 +112,48 @@ These fields have no default value. The application **will not start** without t
   Number of prior conversation turns injected into each LLM prompt as context. Increasing this value improves multi-turn coherence but raises token cost per request.
 </ParamField>
 
+<ParamField path="INTENT_CLASSIFICATION_TEMPERATURE" type="float" default="0.0">
+  Sampling temperature for the intent classification node. `0.0` produces deterministic output.
+</ParamField>
+
+<ParamField path="SQL_GENERATION_TEMPERATURE" type="float" default="0.0">
+  Sampling temperature for SQL generation. `0.0` produces deterministic queries.
+</ParamField>
+
+<ParamField path="EXPLANATION_TEMPERATURE" type="float" default="0.3">
+  Sampling temperature for the explanation generation node.
+</ParamField>
+
+<ParamField path="SQL_CORRECTION_TEMPERATURE" type="float" default="0.0">
+  Sampling temperature for the SQL self-correction node.
+</ParamField>
+
+<ParamField path="ANALYSIS_TEMPERATURE" type="float" default="0.4">
+  Sampling temperature for the report/analysis generation node.
+</ParamField>
+
+<ParamField path="UNDERSTAND_TEMPERATURE" type="float" default="0.0">
+  Sampling temperature for the understand/slot-extraction node.
+</ParamField>
+
 <ParamField path="MAX_CORRECTION_ATTEMPTS" type="integer" default="3">
   Maximum self-correction retries when the SQL validator rejects a generated query. After this many attempts the agent returns an error to the user.
 </ParamField>
 
+<ParamField path="MAX_CLARIFICATION_ROUNDS" type="integer" default="2">
+  Maximum clarification rounds before the agent applies smart defaults and proceeds without user input.
+</ParamField>
+
 <ParamField path="SQL_VALIDATION_ENABLED" type="boolean" default="true">
   Enables `sqlglot`-based validation of every generated SQL statement before execution. Disable only in development when iterating on prompt templates.
+</ParamField>
+
+<ParamField path="INPUT_SANITIZATION_ENABLED" type="boolean" default="true">
+  Enables input sanitization on all user-provided strings before they are passed to LLM nodes or SQL generation.
+</ParamField>
+
+<ParamField path="AUDIT_LOGGING_ENABLED" type="boolean" default="true">
+  Enables audit trail logging. Every query execution is recorded with user, session, generated SQL, and row count.
 </ParamField>
 
 <ParamField path="HITL_ENABLED" type="boolean" default="true">
@@ -116,16 +168,100 @@ These fields have no default value. The application **will not start** without t
   Wall-clock timeout for SQL execution. Queries that exceed this limit are cancelled and the agent reports a timeout error.
 </ParamField>
 
+<ParamField path="LLM_TIMEOUT_SECONDS" type="integer" default="120">
+  Timeout for individual LLM API calls to Bedrock in seconds.
+</ParamField>
+
+---
+
+## Schema registry
+
+<ParamField path="EMBEDDING_DIMENSIONS" type="integer" default="1024">
+  Embedding vector dimensions produced by `BEDROCK_EMBEDDING_MODEL_ID`. Amazon Titan Embed Text v2 defaults to 1024 dimensions.
+</ParamField>
+
+<ParamField path="SCHEMA_REGISTRY_PATH" type="string" default=".claude/skills/erp-financial/references">
+  Path to reference files (`sap-schema.md`, `query-patterns.md`) used by the schema registry.
+</ParamField>
+
+<ParamField path="FAISS_INDEX_DIR" type="string" default="data/faiss_index">
+  Directory where FAISS indexes are persisted on disk. On ECS this maps to an EFS mount so the index survives task restarts.
+</ParamField>
+
+<ParamField path="SCHEMA_TOP_K" type="integer" default="5">
+  Number of schema chunks returned by the schema-registry nearest-neighbour search for each query.
+</ParamField>
+
+<ParamField path="PATTERNS_TOP_K" type="integer" default="3">
+  Number of few-shot query patterns returned by the schema registry for each query.
+</ParamField>
+
+<ParamField path="USE_GENERATED_SCHEMA_CATALOG" type="boolean" default="true">
+  When `true`, the `schema_linker` node prefers the generated YAML-based schema catalog (`yaml_schemas/*.yml`) over the legacy `domain_catalog.py` / `enricher.py` for covered tables. Setting this to `false` is an instant rollback if a covered table misbehaves.
+</ParamField>
+
+---
+
+## Analysis and export
+
+<ParamField path="MAX_EXPORT_ROWS" type="integer" default="5000">
+  Maximum number of rows included in CSV or Excel exports.
+</ParamField>
+
+<ParamField path="CHART_AUTO_DETECT" type="boolean" default="true">
+  When `true`, the visualization node automatically selects the most appropriate chart type based on data shape.
+</ParamField>
+
 ---
 
 ## RBAC
 
 <ParamField path="RBAC_ENFORCE" type="boolean" default="false">
-  Controls whether RBAC policy violations actually block requests. When `false` (shadow mode) violations are logged as warnings but the request proceeds. Set to `true` in production only after verifying no false positives in the audit log. Maps to the `--rbac-enforce` CloudFormation parameter.
+  Controls whether RBAC policy violations actually block requests. When `false` (shadow mode) violations are logged as warnings but the request proceeds. Set to `true` in production only after verifying no false positives in the audit log.
+</ParamField>
+
+<ParamField path="RBAC_SHADOW_LOG" type="boolean" default="true">
+  When `true`, every shadow-denial (a violation that is not blocking because `RBAC_ENFORCE=false`) is logged as a warning. Disable once enforcement is live to reduce log noise.
 </ParamField>
 
 <ParamField path="EXPECTED_TENANT" type="string" default="*">
   Tenant slug this instance serves. `*` allows any tenant (backwards-compatible default). Set to a specific slug (e.g. `agripac`) to restrict access to Cognito users whose `custom:tenantId` claim matches.
+</ParamField>
+
+---
+
+## Multi-tenant panel
+
+<ParamField path="TENANTS_REGISTRY_TABLE" type="string" default="erp-agent-tenants">
+  DynamoDB table name for the tenant registry used by the instance panel feature.
+</ParamField>
+
+<ParamField path="GITHUB_REPO" type="string" default="diegocasasbuenas/gt_langgraph_dev">
+  `owner/repo` whose `provision-tenant.yml` workflow is dispatched by the tenant panel to provision new tenant instances.
+</ParamField>
+
+<ParamField path="GITHUB_TOKEN_SECRET_NAME" type="string" default="erp-agent/github-workflow-token">
+  AWS Secrets Manager secret name for the GitHub Personal Access Token (with `Actions:write` scope) used to dispatch the provisioning workflow.
+</ParamField>
+
+---
+
+## Cognito and rate limiting
+
+<ParamField path="COGNITO_CLIENT_ID" type="string">
+  Optional. AWS Cognito App Client ID. When set, the JWT validator also verifies the `aud` claim in the ID token against this value.
+</ParamField>
+
+<ParamField path="RATE_LIMIT_ENABLED" type="boolean" default="true">
+  Enables per-user rate limiting. When `false`, all rate-limit checks are skipped.
+</ParamField>
+
+<ParamField path="RATE_LIMIT_PER_MINUTE" type="integer" default="20">
+  Maximum requests per minute allowed per authenticated user. Requests beyond this limit receive HTTP 429.
+</ParamField>
+
+<ParamField path="RATE_LIMIT_PER_HOUR" type="integer" default="200">
+  Maximum requests per hour per authenticated user. Enforced independently of the per-minute limit.
 </ParamField>
 
 ---
@@ -142,7 +278,7 @@ These fields have no default value. The application **will not start** without t
 
 ---
 
-## File upload
+## File upload and code execution
 
 <ParamField path="MAX_UPLOAD_SIZE_MB" type="integer" default="10">
   Maximum file size (in megabytes) accepted by the upload endpoint. Requests that exceed this limit are rejected with HTTP 413.
@@ -150,6 +286,54 @@ These fields have no default value. The application **will not start** without t
 
 <ParamField path="MAX_UPLOAD_ROWS" type="integer" default="50000">
   Maximum number of rows accepted in a CSV or Excel upload. Files with more rows are rejected before parsing begins.
+</ParamField>
+
+<ParamField path="FILE_DATA_TTL_MINUTES" type="integer" default="120">
+  TTL in minutes for uploaded file data stored in Redis. After expiry the data is evicted and the user must re-upload.
+</ParamField>
+
+<ParamField path="CODE_EXEC_TIMEOUT_SECS" type="integer" default="30">
+  Timeout in seconds for the code-execution subprocess spawned by the agent.
+</ParamField>
+
+<ParamField path="CODE_EXEC_MEMORY_MB" type="integer" default="512">
+  Memory limit in megabytes for the code-execution subprocess.
+</ParamField>
+
+<ParamField path="CODE_EXEC_MAX_ITERATIONS" type="integer" default="3">
+  Maximum number of code refinement iterations the agent attempts before returning an error.
+</ParamField>
+
+---
+
+## Retry and circuit breaker
+
+<ParamField path="MAX_RETRIES_LLM" type="integer" default="3">
+  Maximum retry attempts for LLM API calls to Bedrock.
+</ParamField>
+
+<ParamField path="MAX_RETRIES_DB" type="integer" default="2">
+  Maximum retry attempts for database operations.
+</ParamField>
+
+<ParamField path="RETRY_BACKOFF_MULTIPLIER" type="integer" default="1">
+  Exponential back-off multiplier applied between retries.
+</ParamField>
+
+<ParamField path="RETRY_BACKOFF_MIN" type="integer" default="2">
+  Minimum wait in seconds before the first retry.
+</ParamField>
+
+<ParamField path="RETRY_BACKOFF_MAX" type="integer" default="10">
+  Maximum wait cap in seconds between retries.
+</ParamField>
+
+<ParamField path="CIRCUIT_BREAKER_FAILURE_THRESHOLD" type="integer" default="5">
+  Number of consecutive failures required to trip the circuit breaker (open state).
+</ParamField>
+
+<ParamField path="CIRCUIT_BREAKER_RECOVERY_TIMEOUT" type="integer" default="60">
+  Seconds after which the circuit breaker transitions from open to half-open and allows a single probe request.
 </ParamField>
 
 ---
@@ -169,11 +353,47 @@ These fields have no default value. The application **will not start** without t
 </ParamField>
 
 <ParamField path="METRICS_ENABLED" type="boolean" default="true">
-  Enables Prometheus metrics collection. Metrics are exposed on the `/metrics` endpoint using the prefix `erp_agent`.
+  Enables Prometheus metrics collection. Metrics are exposed on the `/metrics` endpoint.
+</ParamField>
+
+<ParamField path="METRICS_PREFIX" type="string" default="erp_agent">
+  Prefix applied to all Prometheus metric names.
 </ParamField>
 
 <ParamField path="COST_TRACKING_ENABLED" type="boolean" default="true">
   Enables per-request token cost tracking. Cost is computed using the `COST_PER_1K_*_TOKENS` settings and logged alongside every LLM invocation.
+</ParamField>
+
+<ParamField path="COST_PER_1K_INPUT_TOKENS" type="float" default="0.003">
+  USD cost per 1,000 input tokens for the general model (`BEDROCK_MODEL_ID`, Claude Sonnet 4.5).
+</ParamField>
+
+<ParamField path="COST_PER_1K_OUTPUT_TOKENS" type="float" default="0.015">
+  USD cost per 1,000 output tokens for the general model (`BEDROCK_MODEL_ID`, Claude Sonnet 4.5).
+</ParamField>
+
+<ParamField path="COST_PER_1K_INPUT_TOKENS_REASONING" type="float" default="0.005">
+  USD cost per 1,000 input tokens for the reasoning model (`BEDROCK_REASONING_MODEL_ID`).
+</ParamField>
+
+<ParamField path="COST_PER_1K_OUTPUT_TOKENS_REASONING" type="float" default="0.025">
+  USD cost per 1,000 output tokens for the reasoning model (`BEDROCK_REASONING_MODEL_ID`).
+</ParamField>
+
+<ParamField path="ALERT_LATENCY_THRESHOLD_SECONDS" type="float" default="15.0">
+  Alert is emitted when any request exceeds this latency threshold in seconds.
+</ParamField>
+
+<ParamField path="ALERT_ERROR_RATE_THRESHOLD" type="float" default="0.10">
+  Alert is emitted when the rolling error rate exceeds this fraction (e.g. `0.10` = 10%).
+</ParamField>
+
+<ParamField path="PROMPT_VERSION" type="string" default="v1">
+  Prompt version tag used for A/B testing and evaluation tracking.
+</ParamField>
+
+<ParamField path="EVAL_PARALLEL_WORKERS" type="integer" default="5">
+  Number of parallel workers used by the offline evaluation pipeline.
 </ParamField>
 
 ---
@@ -184,12 +404,8 @@ These fields have no default value. The application **will not start** without t
   JSON-encoded list of origins that the FastAPI CORS middleware will allow. Must be a valid JSON array string in `.env`. Example for local dev with both Vite ports: `["http://localhost:5173","http://localhost:5174"]`.
 </ParamField>
 
-<ParamField path="RATE_LIMIT_PER_MINUTE" type="integer" default="20">
-  Maximum requests per minute allowed per authenticated user. Requests beyond this limit receive HTTP 429.
-</ParamField>
-
-<ParamField path="RATE_LIMIT_PER_HOUR" type="integer" default="200">
-  Maximum requests per hour per authenticated user. Enforced independently of the per-minute limit.
+<ParamField path="API_TIMEOUT" type="integer" default="120">
+  Global API request timeout in seconds.
 </ParamField>
 
 <ParamField path="ENVIRONMENT" type="string" default="development">
@@ -204,7 +420,7 @@ These fields have no default value. The application **will not start** without t
 
 ## Full `.env` example
 
-The snippet below mirrors `.env.example` from the repository root. Copy it, fill in the required fields, and remove the optional sections you don't need.
+The snippet below covers every configurable variable. Copy it, fill in the required fields, and remove the optional sections you don't need.
 
 ```dotenv .env
 # ── AWS Bedrock ────────────────────────────────────────────────────────────────
@@ -212,20 +428,23 @@ BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0
 BEDROCK_REASONING_MODEL_ID=us.anthropic.claude-sonnet-5
 BEDROCK_EMBEDDING_MODEL_ID=amazon.titan-embed-text-v2:0
 
-# ── Database (MySQL RDS) ───────────────────────────────────────────────────────
+# ── Database (MySQL RDS) — required ───────────────────────────────────────────
 DB_HOST=your-rds-host.region.rds.amazonaws.com
 DB_PORT=3306
 DB_NAME=iafinagent
 DB_USER=admin
 DB_PASSWORD=your-db-password
+DB_CONNECT_TIMEOUT=10
+DB_READ_TIMEOUT=30
+DB_WRITE_TIMEOUT=30
 
 # ── AWS ────────────────────────────────────────────────────────────────────────
 AWS_REGION=us-east-1
 AWS_ACCOUNT_ID=123456789012
 
-# ── Cognito ────────────────────────────────────────────────────────────────────
-COGNITO_USER_POOL_ID=us-east-1_2qpNBGCmb
-COGNITO_CLIENT_ID=70qcoifagu4tk20qnn2q8d9rjs
+# ── Cognito — required ────────────────────────────────────────────────────────
+COGNITO_USER_POOL_ID=us-east-1_XXXXXXXXX
+# COGNITO_CLIENT_ID=your-app-client-id
 
 # ── Secrets Manager (optional, production only) ────────────────────────────────
 # DB_PASSWORD_SECRET_ARN=arn:aws:secretsmanager:us-east-1:123456789012:secret:erp-agent/db-password
@@ -238,35 +457,89 @@ SESSION_MAX_MESSAGES=100
 
 # ── Agent behaviour ────────────────────────────────────────────────────────────
 MAX_HISTORY_MESSAGES=5
+INTENT_CLASSIFICATION_TEMPERATURE=0.0
+SQL_GENERATION_TEMPERATURE=0.0
+EXPLANATION_TEMPERATURE=0.3
+SQL_CORRECTION_TEMPERATURE=0.0
+ANALYSIS_TEMPERATURE=0.4
+UNDERSTAND_TEMPERATURE=0.0
 MAX_CORRECTION_ATTEMPTS=3
+MAX_CLARIFICATION_ROUNDS=2
 SQL_VALIDATION_ENABLED=true
+INPUT_SANITIZATION_ENABLED=true
+AUDIT_LOGGING_ENABLED=true
 HITL_ENABLED=true
 MAX_QUERY_ROWS=10000
 QUERY_TIMEOUT_SECONDS=30
+LLM_TIMEOUT_SECONDS=120
+
+# ── Schema registry ────────────────────────────────────────────────────────────
+EMBEDDING_DIMENSIONS=1024
+SCHEMA_REGISTRY_PATH=.claude/skills/erp-financial/references
+FAISS_INDEX_DIR=data/faiss_index
+SCHEMA_TOP_K=5
+PATTERNS_TOP_K=3
+USE_GENERATED_SCHEMA_CATALOG=true
+
+# ── Analysis and export ────────────────────────────────────────────────────────
+MAX_EXPORT_ROWS=5000
+CHART_AUTO_DETECT=true
 
 # ── RBAC ───────────────────────────────────────────────────────────────────────
 RBAC_ENFORCE=false
+RBAC_SHADOW_LOG=true
 EXPECTED_TENANT=*
+
+# ── Multi-tenant panel ─────────────────────────────────────────────────────────
+TENANTS_REGISTRY_TABLE=erp-agent-tenants
+# GITHUB_REPO=diegocasasbuenas/gt_langgraph_dev
+# GITHUB_TOKEN_SECRET_NAME=erp-agent/github-workflow-token
+
+# ── Cognito rate limiting ──────────────────────────────────────────────────────
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_PER_MINUTE=20
+RATE_LIMIT_PER_HOUR=200
 
 # ── DynamoDB memory ────────────────────────────────────────────────────────────
 DYNAMODB_ENABLED=true
 DYNAMODB_TTL_DAYS=90
 
-# ── File upload ────────────────────────────────────────────────────────────────
+# ── File upload and code execution ─────────────────────────────────────────────
 MAX_UPLOAD_SIZE_MB=10
 MAX_UPLOAD_ROWS=50000
+FILE_DATA_TTL_MINUTES=120
+CODE_EXEC_TIMEOUT_SECS=30
+CODE_EXEC_MEMORY_MB=512
+CODE_EXEC_MAX_ITERATIONS=3
 
-# ── Observability ─────────────────────────────────────────────────────────────
+# ── Retry and circuit breaker ──────────────────────────────────────────────────
+MAX_RETRIES_LLM=3
+MAX_RETRIES_DB=2
+RETRY_BACKOFF_MULTIPLIER=1
+RETRY_BACKOFF_MIN=2
+RETRY_BACKOFF_MAX=10
+CIRCUIT_BREAKER_FAILURE_THRESHOLD=5
+CIRCUIT_BREAKER_RECOVERY_TIMEOUT=60
+
+# ── Observability ──────────────────────────────────────────────────────────────
 # LANGSMITH_API_KEY=your-langsmith-api-key
 # LANGSMITH_PROJECT=erp-financial-agent
 # LANGCHAIN_TRACING_V2=true
 METRICS_ENABLED=true
+METRICS_PREFIX=erp_agent
 COST_TRACKING_ENABLED=true
+COST_PER_1K_INPUT_TOKENS=0.003
+COST_PER_1K_OUTPUT_TOKENS=0.015
+COST_PER_1K_INPUT_TOKENS_REASONING=0.005
+COST_PER_1K_OUTPUT_TOKENS_REASONING=0.025
+ALERT_LATENCY_THRESHOLD_SECONDS=15.0
+ALERT_ERROR_RATE_THRESHOLD=0.10
+PROMPT_VERSION=v1
+EVAL_PARALLEL_WORKERS=5
 
 # ── API ────────────────────────────────────────────────────────────────────────
 API_CORS_ORIGINS=["http://localhost:5173"]
-RATE_LIMIT_PER_MINUTE=20
-RATE_LIMIT_PER_HOUR=200
+API_TIMEOUT=120
 ENVIRONMENT=development
 LOG_LEVEL=INFO
 ```

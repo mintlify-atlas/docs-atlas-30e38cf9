@@ -1,7 +1,7 @@
 ---
-title: "Agent Pipeline: Two-Level LangGraph Architecture"
+title: "Agent Pipeline: Two-Level LangGraph Architecture Guide"
 sidebarTitle: "Agent Pipeline"
-description: "How the outer ConversationGraph and inner SQL pipeline Graph work together to turn natural language into ERP insights, with routing, state, and self-correction."
+description: "How the outer ConversationGraph and inner SQL pipeline work together to turn natural language into ERP insights, with routing, state, and self-correction."
 ---
 
 The ERP Financial Agent is built as two nested LangGraph state machines. The **outer** `ConversationGraph` manages the full dialogue lifecycle — understanding intent, filling slots, clarifying ambiguity, and shaping the final response. When a data query is confirmed, it calls into the **inner** SQL pipeline `Graph`, which links schemas, generates and validates MySQL, executes on a read-only pool, and assembles charts or executive summaries before returning control to the outer layer.
@@ -80,7 +80,9 @@ def _route_after_understand(state: dict) -> str:
     if turn_type == "forecast":
         return "forecast"
     if turn_type == "file_analysis":
-        return "analyze_file"   # only if file_data present
+        if state.get("file_data") or state.get("file_metadata"):
+            return "analyze_file"
+        return "general_respond"  # no file data → helpful error
     if turn_type == "discuss":
         return "discuss_data"
     if turn_type == "general":
@@ -233,6 +235,7 @@ def _route_after_visualizer(state: AgentState) -> str:
         conversation_history: list[dict]
         previous_query_results: list[dict]
         previous_column_names: list[str]
+        previous_data_summary: dict
         previous_kpis: dict
 
         # RBAC (injected by execute node from ConversationState)
@@ -276,6 +279,8 @@ def _route_after_visualizer(state: AgentState) -> str:
         # Cross-turn data
         conversation_history: list[dict]
         previous_query_results: list[dict]
+        previous_column_names: list[str]
+        previous_data_summary: dict
         previous_kpis: dict
 
         # File analysis (Sprint 11)

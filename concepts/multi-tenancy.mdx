@@ -1,7 +1,7 @@
 ---
 title: "Multi-Tenancy: Isolated ECS Deployments per Customer"
 sidebarTitle: "Multi-Tenancy"
-description: "How the ERP agent isolates each customer in its own ECS service with a dedicated MySQL schema, and how cross-instance access is managed via Cognito and DynamoDB."
+description: "How the ERP agent isolates each customer in its own ECS service with a dedicated MySQL schema, and manages cross-instance access via Cognito and DynamoDB."
 ---
 
 The ERP Financial Agent uses a **deployment-level isolation** model: every customer (tenant) runs as a completely separate ECS service with its own FastAPI backend, its own MySQL database connection, and its own Cognito group. There is no shared query path between tenants. A single **primary instance** hosts the admin plane and the tenant registry; all other instances are isolated customer deployments.
@@ -189,7 +189,7 @@ The admin panel can hibernate or wake tenant instances to control cost. `start_t
 
 The admin panel (tenant registry, user management, RBAC assignment) is served **exclusively** by the primary instance. Requests arriving at a tenant instance for admin endpoints are rejected because:
 
-1. The tenant instance's `expected_tenant` is a specific slug, so `platform_admin` users are required.
+1. `require_primary_instance()` checks `settings.expected_tenant != "*"` and immediately returns **HTTP 404** (not 403, to avoid revealing the panel exists). This fires before any permission check, so no user — regardless of role — can access admin endpoints on a tenant instance.
 2. The tenant instance's IAM role does not grant `dynamodb:Scan` on `erp-agent-tenants` or `ecs:UpdateService` on other clusters.
 
 This double isolation (application-level + IAM) ensures that a compromised tenant instance cannot affect other tenants or the provisioning plane.

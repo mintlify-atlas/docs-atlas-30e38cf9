@@ -75,11 +75,15 @@ The RBAC system maps Cognito group membership to roles and permissions. Create t
 
 | Group name | Role | Typical permissions |
 |---|---|---|
-| `admin` | System administrator | Full access including RBAC overrides |
-| `org_admin` | Organisation administrator | User management, all data modules |
-| `finance_lead` | Finance lead | All financial modules, export |
+| `platform_admin` | Platform administrator | Full access including RBAC overrides and cross-tenant operations |
+| `org_admin` | Organisation administrator | User management, all financial data modules |
+| `finance_lead` | Finance lead | All financial modules, export, file upload |
 | `analyst` | Analyst | Read + export on assigned modules |
 | `viewer` | Read-only viewer | Query only, no export |
+
+<Note>
+  The legacy group names `admin`, `admins`, and `administrators` are recognised as aliases for `org_admin` for backwards compatibility. New deployments should use `platform_admin` and `org_admin` directly.
+</Note>
 
 <Tip>
   Assign users to groups in the Cognito console or via `aws cognito-idp admin-add-user-to-group`. The group list appears in the `cognito:groups` claim of the ID token and is read by `resolve_principal()` in `src/core/auth.py`.
@@ -90,7 +94,7 @@ The RBAC system maps Cognito group membership to roles and permissions. Create t
 Each API request must include `Authorization: Bearer <id_token>`. The `CognitoJWTValidator` class in `src/core/auth.py`:
 
 1. Extracts the `kid` (key ID) from the JWT header.
-2. Fetches the JWKS document from `https://cognito-idp.us-east-1.amazonaws.com/<pool_id>/.well-known/jwks.json` (cached for 1 hour, auto-refreshed on key rotation).
+2. Fetches the JWKS document from `https://cognito-idp.{region}.amazonaws.com/{user_pool_id}/.well-known/jwks.json` (cached for 1 hour, auto-refreshed on key rotation).
 3. Verifies the RS256 signature using the matching public key.
 4. Checks `token_use == "id"` and validates the issuer URL.
 5. When `COGNITO_CLIENT_ID` is set, also verifies the `aud` claim.

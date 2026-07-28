@@ -1,7 +1,7 @@
 ---
-title: "Two-level LangGraph architecture of the ERP Agent"
+title: "Two-level LangGraph architecture of the ERP Financial Agent"
 sidebarTitle: "Architecture"
-description: "How the outer Conversation Graph and inner SQL Pipeline Graph interact, including routing logic, the self-correction loop, HITL gate, and Schema Registry design."
+description: "How the outer Conversation Graph and inner SQL Pipeline interact — routing logic, self-correction loop, HITL gate, and Schema Registry design."
 ---
 
 The ERP Financial Agent is structured as two independently compiled LangGraph `StateGraph` instances that work together: an **outer Conversation Graph** that manages the full lifecycle of a conversational turn, and an **inner SQL Pipeline Graph** that owns all data-retrieval mechanics. This separation keeps orchestration concerns (clarification, planning, forecasting) cleanly isolated from query concerns (schema linking, SQL generation, validation, execution, visualization).
@@ -156,7 +156,7 @@ def _route_by_intent(state: AgentState) -> str:
 
 ## Self-correction loop
 
-When `sql_validator` finds errors it routes to `error_handler`, which rewrites the generation prompt with the specific error context and feeds it back into `sql_validator`. The loop runs a maximum of **3 attempts** (`MAX_CORRECTION_ATTEMPTS`). After that, or if a security violation is detected, the graph routes to `give_up → response_formatter`.
+When `sql_validator` finds errors it routes to `error_handler`, which rewrites the generation prompt with the specific error context and feeds it back into `sql_validator`. The loop runs a maximum of **3 attempts** (controlled by `settings.max_correction_attempts`, default `3`). After that, or if a security violation is detected, the graph routes to `give_up → response_formatter`.
 
 ```python src/agent/graph.py
 def _route_after_validation(state: AgentState) -> str:
@@ -246,11 +246,8 @@ The Schema Registry is built at startup (`build_schema_registry()`) and provides
 | **Auth** | AWS Cognito JWT — validated server-side via `python-jose[cryptography]` |
 | **Cache / Sessions** | Redis 7 (ElastiCache) — async pool via `redis[hiredis]` |
 | **Long-term memory** | DynamoDB — 90-day TTL on conversation history + RBAC overrides |
-| **Schema index** | FAISS CPU (`faiss-cpu >= 1.8.0`) |
 | **Infrastructure** | AWS ECS Fargate + ALB + NAT Gateway |
 | **Observability** | Prometheus (`prometheus-client`) + structlog + LangSmith tracing |
-| **Forecasting** | StatsForecast (`statsforecast >= 1.7.0`) |
-| **SQL parsing** | sqlglot (`sqlglot >= 26.0.0`) |
 
 ---
 

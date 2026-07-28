@@ -1,7 +1,7 @@
 ---
-title: "Monitoring, Metrics, and Observability"
+title: "ERP Agent Prometheus Metrics, Alerts, and LangSmith"
 sidebarTitle: "Monitoring"
-description: "Observe ERP Financial Agent with Prometheus metrics, Grafana dashboards, LangSmith LLM tracing, cost tracking per user and node, and structured logging."
+description: "Observe ERP Financial Agent in production: Prometheus metrics with alert rules, Grafana dashboards, LangSmith LLM traces, and CloudWatch logs."
 ---
 
 The ERP Financial Agent exposes a rich observability surface: a Prometheus `/metrics` endpoint that tracks LLM latency, token consumption, SQL execution, and HTTP traffic; a Grafana dashboard provisioned automatically from `monitoring/grafana/dashboards/erp-agent.json`; LangSmith trace integration for every LangGraph invocation; per-user and per-node cost accounting backed by Redis and DynamoDB; and structured JSON logs with correlation IDs via `structlog`. All components can be started locally with a single Compose command.

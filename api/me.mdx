@@ -1,5 +1,5 @@
 ---
-title: "Identity API — Current User Permissions & Role"
+title: "Identity API — Effective Role & Permission Detail"
 sidebarTitle: "Me"
 description: "Retrieve the calling user's resolved role, permissions, data modules, and instance access. The single source of truth for frontend access control."
 ---
@@ -103,10 +103,6 @@ Returns the calling user's resolved `Principal` as a public dictionary. The same
   `true` only on the primary instance (where `expected_tenant == "*"`). The frontend uses this flag to show or hide the admin panel navigation link. The admin plane does not exist on tenant-specific deployments — see dev-log/037.
 </ResponseField>
 
-<ResponseField name="allowed_cebes" type="array" required>
-  List of centro de beneficio codes the user's queries are restricted to (`custom:data_scope`). An **empty array** means no row-level restriction — the user sees all cebes. A non-empty array causes the SQL generator to automatically add a `WHERE centro_beneficio IN (...)` clause.
-</ResponseField>
-
 <ResponseField name="allowed_tenants" type="array" required>
   Additional instance slugs the user is authorised to access beyond their home tenant (`custom:tenants`). A `platform_admin` can access all instances regardless of this list.
 </ResponseField>
@@ -145,7 +141,6 @@ curl -X GET https://api.example.com/api/me \
   ],
   "labor_cost_restricted": false,
   "admin_panel": false,
-  "allowed_cebes": [],
   "allowed_tenants": []
 }
 ```
@@ -169,7 +164,6 @@ curl -X GET https://api.example.com/api/me \
   ],
   "labor_cost_restricted": true,
   "admin_panel": false,
-  "allowed_cebes": ["1000", "2000", "3500"],
   "allowed_tenants": []
 }
 ```
@@ -208,7 +202,6 @@ curl -X GET https://api.example.com/api/me \
   ],
   "labor_cost_restricted": false,
   "admin_panel": true,
-  "allowed_cebes": [],
   "allowed_tenants": []
 }
 ```

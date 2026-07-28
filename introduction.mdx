@@ -1,7 +1,7 @@
 ---
-title: "ERP Financial Agent: Text-to-SQL for SAP data"
+title: "ERP Financial Agent: Conversational Text-to-SQL for SAP"
 sidebarTitle: "Introduction"
-description: "Conversational BI assistant that turns Spanish-language questions into SQL queries over SAP ERP data, powered by LangGraph, AWS Bedrock Claude Sonnet 4.5, and a React chat UI."
+description: "Conversational BI assistant turning Spanish questions into validated SQL over SAP ERP data, powered by LangGraph, AWS Bedrock, and a React chat UI."
 ---
 
 GTCLOUD Assistant is a production-grade financial intelligence platform designed for business users who need instant answers from SAP ERP data — without writing a single line of SQL. Type a question in natural Spanish, and the agent classifies your intent, selects the right tables via semantic search, generates a validated SQL query, executes it against your MySQL ERP database, and streams back formatted results complete with charts, KPI cards, and an executive summary, all within a single conversational turn.
@@ -34,7 +34,6 @@ The system is built around a **two-level LangGraph architecture**: an outer *Con
 | **Auth** | AWS Cognito (JWT) — validated server-side via `python-jose` |
 | **Cache / Sessions** | Redis 7 (ElastiCache) — async pool via `redis[hiredis]` |
 | **Long-term memory** | DynamoDB — 90-day TTL on conversation history |
-| **Schema Registry** | FAISS CPU vector index + Amazon Titan V2 embeddings |
 | **Infrastructure** | AWS ECS Fargate + ALB + NAT Gateway |
 | **Observability** | Prometheus counters/histograms + structlog + LangSmith tracing |
 
