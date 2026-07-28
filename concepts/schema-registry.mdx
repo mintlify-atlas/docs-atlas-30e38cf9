@@ -1,0 +1,257 @@
+---
+title: "Schema Registry: Connecting Questions to ERP Tables"
+sidebarTitle: "Schema Registry"
+description: "How the schema registry uses FAISS vector search, YAML catalogs, and a MetricsRegistry to map natural language questions to the right ERP tables and columns."
+---
+
+The Schema Registry is the intelligence layer that bridges natural language questions and MySQL query generation. Rather than forcing users to know table names, the registry uses semantic vector search to find the most relevant ERP tables, enriches them with curated business rules and join hints, and supplies pre-defined KPI formulas — so the SQL generator receives precise, trustworthy context on every request.
+
+## Component Map
+
+<CardGroup cols={2}>
+  <Card title="SchemaMetadata" icon="database">
+    Reads `INFORMATION_SCHEMA` on startup to build table comments, column types, nullability, keys, and sample values. Cached in Redis with a 1-hour TTL and shared across ECS tasks.
+  </Card>
+  <Card title="FAISS Vector Store" icon="magnifying-glass">
+    Two indexes — one for table descriptions, one for few-shot query patterns. Both use Amazon Titan V2 embeddings (1024 dimensions). Top-k retrieval drives the `schema_linker` node.
+  </Card>
+  <Card title="DomainCatalog" icon="book">
+    Curated `TableCatalogEntry` objects for every ERP table: business name, column roles (MEASURE/DIMENSION/FILTER/KEY), valid GROUP BY dimensions, primary measures, join hints, and gotchas.
+  </Card>
+  <Card title="MetricsRegistry" icon="chart-line">
+    Named KPIs with SQL formula templates, required source tables, JOIN conditions, and unit labels. Matched by synonym lookup against the user's question.
+  </Card>
+</CardGroup>
+
+---
+
+## SchemaMetadata: Live Database Introspection
+
+`SchemaMetadataReader` (in `src/schema_registry/schema_metadata.py`) queries `INFORMATION_SCHEMA.TABLES` and `INFORMATION_SCHEMA.COLUMNS` on startup to build an in-memory cache of every table and column.
+
+```python
+# Cold-start sequence (each ECS task)
+async def _ensure_loaded(self) -> None:
+    if self._last_refresh is None:
+        if await self._load_from_redis():   # try shared cache first
+            return
+        await self.refresh()                # otherwise hit INFORMATION_SCHEMA
+        return
+    age_minutes = (datetime.now(UTC) - self._last_refresh).total_seconds() / 60
+    if age_minutes > 30:
+        await self.refresh()               # stale after 30 min — re-read
+```
+
+The reader provides:
+- `get_all_tables()` — full `TableMetadata` dict (name, type, comment, row count, columns)
+- `build_schema_summary()` — compact ~1500-token summary for the `understand` node
+- `build_detailed_context(table_names)` — full DDL-like context for the SQL generator
+- `load_sample_values(table, columns)` — distinct sample values for low-cardinality columns
+
+<Note>
+  Redis keys `schema:metadata` and `schema:summary` are written after every `INFORMATION_SCHEMA` refresh and expire in 3600 seconds (1 hour). ECS tasks that start cold hit Redis first, avoiding a redundant DB round-trip.
+</Note>
+
+---
+
+## FAISS Vector Store
+
+`SchemaRegistry` (in `src/schema_registry/store.py`) manages two FAISS indexes built from reference markdown files using `BedrockEmbeddings` with Amazon Titan V2.
+
+```python
+class SchemaRegistry:
+    schema_store: FAISS    # table descriptions → semantic search
+    patterns_store: FAISS  # few-shot query examples → retrieval
+
+    def search_tables(self, query: str, top_k: int | None = None) -> list[Document]:
+        k = top_k or settings.schema_top_k   # default 5
+        return self.schema_store.similarity_search(query, k=k)
+
+    def search_patterns(self, query: str, top_k: int | None = None) -> list[Document]:
+        k = top_k or settings.patterns_top_k  # default 3
+        return self.patterns_store.similarity_search(query, k=k)
+```
+
+### Configuration
+
+| Setting | Default | Description |
+|---|---|---|
+| `SCHEMA_TOP_K` | `5` | Tables returned per semantic search |
+| `PATTERNS_TOP_K` | `3` | Few-shot examples returned per query |
+| `FAISS_INDEX_DIR` | — | If set, indexes are persisted to disk and reloaded on restart |
+| `BEDROCK_EMBEDDING_MODEL_ID` | `amazon.titan-embed-text-v2:0` | 1024-dim embeddings |
+
+### Startup Sequence
+
+<Steps>
+  <Step title="Check disk cache">
+    If `FAISS_INDEX_DIR` is set and `index.faiss` files exist under `schema/` and `patterns/` subdirectories, the indexes are loaded from disk using `FAISS.load_local()`. Table metadata is still parsed for column lookup.
+  </Step>
+  <Step title="Parse reference files">
+    `parse_sap_schema(sap-schema.md)` and `parse_query_patterns(query-patterns.md)` build `TableDocument` and pattern objects from the markdown reference files in the schema registry path.
+  </Step>
+  <Step title="Build FAISS indexes">
+    `FAISS.from_documents(schema_docs, embeddings)` and `FAISS.from_documents(pattern_docs, embeddings)` call Bedrock to embed all documents and build the two in-memory indexes.
+  </Step>
+  <Step title="Persist to disk">
+    If `FAISS_INDEX_DIR` is configured, both indexes are saved with `save_local()` so subsequent container starts skip the embedding step entirely.
+  </Step>
+</Steps>
+
+<Warning>
+  `allow_dangerous_deserialization=True` is required by LangChain's FAISS wrapper (it uses `pickle` internally). Only load indexes from files written by your own build process — never from untrusted external sources.
+</Warning>
+
+---
+
+## DomainCatalog: Curated Business Semantics
+
+`DomainCatalog` (in `src/schema_registry/domain_catalog.py`) provides column-level business semantics that `INFORMATION_SCHEMA` alone cannot supply.
+
+### Column Roles
+
+```python
+class ColumnRole(StrEnum):
+    MEASURE     = "measure"      # SUM/AVG candidate (importe_ml, valor)
+    DIMENSION   = "dimension"    # GROUP BY candidate (periodo, material)
+    FILTER      = "filter"       # WHERE candidate (version, moneda)
+    KEY         = "key"          # JOIN key (cuenta_contable, orden)
+    IDENTIFIER  = "identifier"   # PK — never GROUP BY or SUM
+    TEMPORAL    = "temporal"     # date/period fields
+    DESCRIPTIVE = "descriptive"  # text labels (texto_breve_material)
+```
+
+### TableCatalogEntry Structure
+
+```python
+@dataclass
+class TableCatalogEntry:
+    table_name: str
+    business_name: str          # "Ingresos por Ventas"
+    business_description: str   # full business context
+    domain: str                 # ventas | costos | produccion | ...
+    columns: dict[str, ColumnSpec]
+    example_questions: list[str]
+    valid_dimensions: list[str]  # safe GROUP BY columns
+    primary_measures: list[str]  # safe SUM/AVG columns
+    gotchas: list[str]           # critical warnings (TRM, JOIN name mismatches)
+    requires_trm: bool           # True if importe_ml needs COP conversion
+    has_periodo: bool            # True if table has YYYYMM periodo column
+```
+
+### Notable Gotchas Captured
+
+<Accordion title="Currency conversion (TRM) — ia_fct_ingresos">
+  `importe_ml` is **not** always in COP. Verified 2026-07-09: 65% USD, 6% PEN, only 29% COP. All queries on this table must `LEFT JOIN ia_dm_trm` and apply:
+
+  ```sql
+  CASE WHEN moneda_libro_mayor = 'COP'
+       THEN importe_ml
+       ELSE importe_ml * ia_dm_trm.valor
+  END
+  ```
+</Accordion>
+
+<Accordion title="JOIN name mismatches">
+  Several fact→dimension JOINs use different column names on each side:
+  - `ia_fct_ingresos.solicitante` = `ia_dm_clientes.deudor`
+  - `ia_fct_ingresos.grupo_de_vendedores` = `ia_dm_grupo_vendedores.grupo_vendedores`
+  - `ia_fct_ingresos.oficina_ventas` = `ia_dm_oficina_venta.oficina_venta`
+  - `ia_fct_cabecera_pedidos_compras.proveedor` = `ia_dm_proveedores.acreedor`
+</Accordion>
+
+<Accordion title="Preferred tables for cost queries">
+  `ia_fct_costos_centros` **no longer exists** in the live database. All cost queries must use `ia_fct_gastos_costos_ingresos_balance` (preferred) or `ia_fct_gastos_costos_ingresos`. The domain catalog marks the old table as OBSOLETA to prevent the SQL generator from referencing it.
+</Accordion>
+
+<Accordion title="Version filter in budget tables">
+  `ia_fct_gastos_costos_ingresos_balance` always has `version=1` — **do not filter by version**. The real vs. budget distinction is expressed by which table you query, not by the `version` column.
+</Accordion>
+
+---
+
+## MetricsRegistry: Pre-Defined KPIs
+
+`MetricsRegistry` (in `src/schema_registry/metrics_registry.py`) maps business KPI names to SQL formula templates.
+
+### Sample KPI Definitions
+
+```python
+METRICS_REGISTRY = {
+    "ingreso_total_cop": {
+        "description": "Ingreso neto total en pesos colombianos (requiere conversion TRM)",
+        "formula": (
+            "SUM(CASE WHEN ia_fct_ingresos.moneda_libro_mayor = 'COP' "
+            "THEN ia_fct_ingresos.importe_ml "
+            "ELSE ia_fct_ingresos.importe_ml * ia_dm_trm.valor END)"
+        ),
+        "tables": ["ia_fct_ingresos", "ia_dm_trm"],
+        "aggregation": "SUM",
+        "unit": "COP",
+    },
+    "margen_bruto": {
+        "formula": (
+            "SUM(... importe_ml with TRM ...) "
+            "- SUM(vw_costo_venta.costo_total_venta)"
+        ),
+        "tables": ["ia_fct_ingresos", "ia_dm_trm", "vw_costo_venta"],
+        "aggregation": "calculated",
+        "unit": "COP",
+    },
+    "cobertura_inventario": {
+        "formula": "vw_cobertura_inventario.cobertura_inventario",
+        "tables": ["vw_cobertura_inventario"],
+        "aggregation": "scalar",
+        "unit": "dias",
+    },
+}
+```
+
+Spanish synonym lookup maps plain-language terms to registry keys before the SQL generator receives context:
+
+```python
+METRIC_SYNONYMS = {
+    "ingresos totales": "ingreso_total_cop",
+    "ventas totales":   "ingreso_total_cop",
+    "margen":           "margen_bruto",
+    "nomina":           "costo_nomina",
+    "cobertura":        "cobertura_inventario",
+    "kardex":           "kardex_saldo_acumulado",
+    # ... 80+ synonyms
+}
+```
+
+`find_metrics_for_question(question)` returns up to **3** matching metric dicts. `get_metric_context(question)` formats them into a `## Metricas de Referencia` block injected into the SQL generator prompt.
+
+---
+
+## YAML Schemas and CatalogFromYaml
+
+In addition to the programmatic `DomainCatalog`, the registry supports **60+ ERP tables** documented in YAML files under the `yaml_schemas/` directory. When `use_generated_schema_catalog=True` (the preferred setting), `CatalogFromYaml` builds the full domain catalog from these YAML files at startup, replacing the hardcoded Python catalog.
+
+This allows schema updates (new tables, column renames, new join hints) to be made in YAML without modifying Python code.
+
+---
+
+## Schema Drift Detection
+
+`consistency_check.py` compares the live `INFORMATION_SCHEMA` state against the YAML schemas to detect drift:
+
+<CardGroup cols={2}>
+  <Card title="Column added" icon="plus">
+    A column present in the live DB but absent from the YAML — the agent may miss it in context.
+  </Card>
+  <Card title="Column removed" icon="minus">
+    A column documented in YAML but gone from the live DB — generated SQL will fail at runtime.
+  </Card>
+  <Card title="Type mismatch" icon="triangle-exclamation">
+    Column type differs between live DB and YAML documentation — aggregation gotchas may apply.
+  </Card>
+  <Card title="Table missing" icon="xmark">
+    A YAML-documented table does not exist in the live DB — the `ia_fct_costos_centros` scenario.
+  </Card>
+</CardGroup>
+
+<Tip>
+  Run `consistency_check.py` after each ERP data load or SAP migration to catch schema drift before it produces incorrect SQL in production.
+</Tip>

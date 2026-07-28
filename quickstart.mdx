@@ -1,47 +1,164 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Run the ERP Financial Agent locally in minutes"
+sidebarTitle: "Quickstart"
+description: "Step-by-step guide to clone, configure, and launch the backend and React frontend against a MySQL SAP ERP database on your local machine."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+This guide walks you from a fresh checkout to a fully operational chat session. You'll configure the required AWS and database credentials, start all services, verify the health endpoint, and send your first Spanish-language financial query through the React UI. The entire flow takes about five minutes once prerequisites are in place.
 
 ## Prerequisites
 
-Before you begin, you must have:
+Before you begin, make sure you have the following installed and accessible:
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+- **Python 3.12+** — the project targets `requires-python = ">=3.12"` in `pyproject.toml`
+- **[uv](https://docs.astral.sh/uv/)** — the package and virtual-environment manager used throughout (`uv sync`, `uv run`)
+- **Node.js 18+** — required for the React/Vite frontend
+- **Docker & Docker Compose** — needed for the all-in-one Compose workflow (includes Redis)
+- **AWS account** with:
+  - Amazon Bedrock access enabled for Claude Sonnet 4.5 in your region
+  - An Amazon Cognito User Pool and App Client for authentication
+- **MySQL database** containing your SAP ERP schema (accessible from your machine or a tunnel)
 
-## Get started
+---
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
+  <Step title="Clone the repository">
     ```bash
-    npm install your-package
+    git clone https://github.com/yohangr3/agentelanggrafh.git
+    cd agentelanggrafh
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Configure environment variables">
+    Copy the provided example file and fill in every required value:
 
     ```bash
-    your-cli init
+    cp .env.example .env
     ```
+
+    Open `.env` in your editor. The minimum required variables are:
+
+    ```bash .env
+    # MySQL (SAP ERP database)
+    DB_HOST=your-rds-host.region.rds.amazonaws.com
+    DB_PORT=3306
+    DB_USER=admin
+    DB_PASSWORD=your-db-password
+    DB_NAME=iafinagent
+
+    # AWS Bedrock
+    AWS_REGION=us-east-1
+    BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0
+
+    # AWS Cognito authentication
+    COGNITO_USER_POOL_ID=us-east-1_XXXXXXXXX
+    COGNITO_CLIENT_ID=your-cognito-app-client-id
+
+    # Redis (overridden automatically when using Docker Compose)
+    REDIS_URL=redis://localhost:6379/0
+    ```
+
+    <Note>
+      `BEDROCK_EMBEDDING_MODEL_ID` defaults to `amazon.titan-embed-text-v2:0`. You only need to override it if you are using a different embeddings model or cross-region inference prefix.
+    </Note>
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Start all services with Docker Compose">
+    The Compose file at `infra/docker/docker-compose.yml` starts three services: **redis**, **app** (FastAPI backend on port 8000), and **frontend** (React SPA served on port 5173). The `app` service overrides `REDIS_URL` to point to the Compose-internal Redis container.
 
     ```bash
-    your-cli start
+    docker compose -f infra/docker/docker-compose.yml up
+    ```
+
+    The backend will automatically build the FAISS Schema Registry on first start, which indexes every table in your MySQL database using Amazon Titan V2 embeddings.
+
+    <Note>
+      **Schema Registry cold-start:** On a fresh database connection, building the FAISS index can take up to **120 seconds**. The startup sequence enforces this as a hard timeout — if it is exceeded the process exits with `RuntimeError: Schema Registry build timed out during startup`. Subsequent starts are faster because the schema metadata is cached in Redis.
+    </Note>
+  </Step>
+
+  <Step title="Or run backend and frontend separately">
+    If you prefer to develop without Docker, run each service independently:
+
+    <CodeGroup>
+
+    ```bash Backend (port 8000)
+    # Install Python dependencies into a managed venv
+    uv sync
+
+    # Start the FastAPI server with hot reload
+    uv run uvicorn src.api.main:app --reload
+    ```
+
+    ```bash Frontend (port 5173)
+    cd frontend
+
+    # Install Node dependencies
+    npm install
+
+    # Start the Vite dev server
+    npm run dev
+    ```
+
+    </CodeGroup>
+
+    Make sure Redis is running locally on `redis://localhost:6379/0` (or update `REDIS_URL` in your `.env`).
+  </Step>
+
+  <Step title="Verify the health endpoint">
+    Once the backend is up, confirm the service is healthy and the database connection is live:
+
+    ```bash
+    curl http://localhost:8000/health
+    ```
+
+    A successful response looks like:
+
+    ```json
+    {
+      "status": "healthy",
+      "database": "connected",
+      "environment": "development",
+      "langsmith_enabled": false,
+      "metrics_enabled": true
+    }
+    ```
+
+    A `"status": "degraded"` response means the MySQL connection failed — double-check `DB_HOST`, `DB_USER`, and `DB_PASSWORD`.
+  </Step>
+
+  <Step title="Open the chat UI and send your first query">
+    Navigate to [http://localhost:5173](http://localhost:5173) in your browser. You will be prompted to log in via your AWS Cognito User Pool. After authenticating, type a financial question in Spanish into the chat input, for example:
+
+    > *¿Cuáles son los 10 centros de costo con mayor gasto en el último trimestre?*
+
+    The agent will classify the intent, link relevant tables via semantic search, generate SQL, validate it, execute it against your ERP database, and stream back a result table, KPI cards, and an auto-selected chart.
+  </Step>
+
+  <Step title="Run the test suite">
+    Validate your setup with the unit tests before making any code changes:
+
+    ```bash
+    uv run pytest tests/unit -v
+    ```
+
+    For full integration tests (requires a live database and AWS credentials):
+
+    ```bash
+    uv run pytest tests/integration -v
     ```
   </Step>
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## What's next?
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Understand how the two-level LangGraph design works, including routing, the self-correction loop, and the HITL gate.
+  </Card>
+  <Card title="Chat API reference" icon="code" href="/api/chat">
+    Explore the `/chat` REST endpoint and the `/ws/chat` WebSocket for streaming per-node events to custom frontends.
+  </Card>
+</CardGroup>

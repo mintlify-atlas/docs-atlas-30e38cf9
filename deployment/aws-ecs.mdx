@@ -1,0 +1,229 @@
+---
+title: "AWS ECS Fargate Deployment Guide"
+sidebarTitle: "AWS ECS"
+description: "Deploy ERP Financial Agent to AWS ECS Fargate using three CloudFormation stacks: network, services, and CI/CD. Includes ALB, ECR, auto-scaling, and GitHub Actions."
+---
+
+The ERP Financial Agent runs on AWS ECS Fargate behind an Application Load Balancer. Three CloudFormation stacks describe the full infrastructure: the network layer (VPC, subnets, NAT), the services layer (ECS cluster, task definitions, ALB, ECR, ElastiCache, DynamoDB), and the CI/CD layer (GitHub OIDC provider and the IAM role that GitHub Actions assumes). A `deploy.sh` script ties them together for an initial rollout; subsequent deployments are fully automated via GitHub Actions.
+
+## Architecture overview
+
+```
+Internet
+   │
+   ▼
+Application Load Balancer  (public subnets: 10.0.1.0/24, 10.0.2.0/24)
+   │
+   ▼
+ECS Fargate Tasks          (private subnets: 10.0.10.0/24, 10.0.20.0/24)
+├── frontend container (nginx :80)
+└── backend container  (uvicorn :8000)
+          │
+          ├── ElastiCache Redis (cache.t3.micro, port 6379)
+          ├── RDS MySQL         (via Secrets Manager password)
+          ├── AWS Bedrock       (Anthropic Claude models)
+          └── DynamoDB          (conversation history, query log)
+          │
+   NAT Gateway               (outbound internet for ECR pulls, Bedrock)
+```
+
+The ALB sits in two public subnets across two availability zones for high availability. ECS tasks run in private subnets and reach the internet only through a single NAT Gateway (placed in `PublicSubnet1` for cost optimization). Redis and RDS are similarly restricted to the private subnets.
+
+## CloudFormation stacks
+
+<Accordion title="network.yaml — VPC, subnets, NAT Gateway, security groups">
+  Creates the entire network layer. Resources are tagged with `Project: erp-agent` and the environment name.
+
+  | Resource | Value |
+  |----------|-------|
+  | VPC CIDR | `10.0.0.0/16` |
+  | Public subnet 1 | `10.0.1.0/24` (AZ-a) — ALB + NAT Gateway |
+  | Public subnet 2 | `10.0.2.0/24` (AZ-b) — ALB high availability |
+  | Private subnet 1 | `10.0.10.0/24` (AZ-a) — ECS + ElastiCache |
+  | Private subnet 2 | `10.0.20.0/24` (AZ-b) — ECS + ElastiCache HA |
+  | NAT Gateway | Elastic IP in `PublicSubnet1` |
+  | ALB security group | Allows TCP 80 from `0.0.0.0/0` |
+  | ECS security group | Allows TCP 80 from ALB security group only |
+  | Redis security group | Allows TCP 6379 from ECS security group only |
+
+  Stack outputs (`{EnvironmentName}-*`) are imported by the services stack: `VpcId`, `PublicSubnet1Id`, `PublicSubnet2Id`, `PrivateSubnet1Id`, `PrivateSubnet2Id`, `ALBSecurityGroupId`, `ECSSecurityGroupId`, `RedisSecurityGroupId`.
+</Accordion>
+
+<Accordion title="services.yaml — ECS cluster, task definitions, ALB, ECR, Redis, DynamoDB">
+  Creates all compute and data resources. It imports networking outputs from the network stack.
+
+  **ECS task definition** (`erp-agent-task-{env}`):
+  - CPU: `2048` (2 vCPU)
+  - Memory: `4096` MB
+  - Two containers: `backend` (port 8000) and `frontend` (port 80)
+  - Network mode: `awsvpc` — each task gets its own ENI in a private subnet
+
+  **Task IAM roles:**
+  - *Execution role* — pulls images from ECR, writes to CloudWatch Logs, reads the DB password from Secrets Manager
+  - *Task role* — calls `bedrock:InvokeModel` / `bedrock:ConverseStream` on Anthropic and Amazon Titan models; reads/writes `erp-agent-conversations`, `erp-agent-query-log`, and `erp-agent-rbac-overrides` DynamoDB tables; puts/gets objects in the exports S3 bucket
+
+  **Auto-scaling**: target tracking on `ECSServiceAverageCPUUtilization` at 70% CPU (configurable via `CpuTarget`). Scale-out cooldown is 60 s; scale-in cooldown is 300 s. Maximum capacity is 4 tasks.
+
+  **ALB target group health check**: `GET /health` on port 80, HTTP 200, every 30 seconds. Stickiness is enabled with a 1-hour `lb_cookie`.
+
+  **CloudWatch alarms**: high CPU (>80% for 3 minutes), unhealthy hosts (>0 for 2 minutes), HTTP 5xx errors (>10 per minute for 2 minutes).
+
+  **DynamoDB tables** (on-demand billing, created only on the primary stack):
+  - `erp-agent-conversations` — partition key `user_id`, sort key `session_id`, TTL on `ttl`
+  - `erp-agent-query-log` — partition key `query_id`, sort key `timestamp`
+</Accordion>
+
+<Accordion title="cicd.yaml — GitHub OIDC, IAM role for GitHub Actions">
+  Provisions the trust relationship between GitHub Actions and AWS using OIDC — no long-lived access keys needed.
+
+  - Creates (or imports) an `AWS::IAM::OIDCProvider` for `token.actions.githubusercontent.com`
+  - Creates the `github-actions-erp-agent` IAM role, trusted only by the configured `GitHubOrg/GitHubRepo`
+  - Grants the role: ECR push, ECS `UpdateService` + `RegisterTaskDefinition`, CloudWatch Logs, Bedrock invocation (for evaluation workflows), Secrets Manager read, and full provisioning permissions for tenant stacks
+
+  After deploying this stack, copy the `GitHubActionsRoleArn` output and store it as the `AWS_ROLE_ARN` secret in your GitHub repository settings.
+</Accordion>
+
+## Initial deployment
+
+<Steps>
+  <Step title="Install and configure the AWS CLI">
+    ```bash
+    aws configure
+    # Region: us-east-1
+    # Output: json
+    ```
+  </Step>
+
+  <Step title="Deploy the network stack">
+    ```bash
+    cd infra/cloudformation
+    ./deploy.sh network
+    ```
+
+    This creates the `erp-agent-network` stack. Wait for the stack to reach `CREATE_COMPLETE` before proceeding — the services stack imports its outputs.
+  </Step>
+
+  <Step title="Build and push Docker images to ECR">
+    After the services stack is deployed (step 4), ECR repositories will exist. You can also push manually before the first ECS deploy:
+
+    ```bash
+    # Authenticate to ECR
+    aws ecr get-login-password --region us-east-1 | \
+      docker login --username AWS \
+      --password-stdin <account-id>.dkr.ecr.us-east-1.amazonaws.com
+
+    # Build and push backend
+    docker build -t erp-agent/backend -f infra/docker/Dockerfile .
+    docker tag erp-agent/backend \
+      <account-id>.dkr.ecr.us-east-1.amazonaws.com/erp-agent/backend:latest
+    docker push \
+      <account-id>.dkr.ecr.us-east-1.amazonaws.com/erp-agent/backend:latest
+
+    # Build and push frontend
+    docker build -t erp-agent/frontend ./frontend
+    docker tag erp-agent/frontend \
+      <account-id>.dkr.ecr.us-east-1.amazonaws.com/erp-agent/frontend:latest
+    docker push \
+      <account-id>.dkr.ecr.us-east-1.amazonaws.com/erp-agent/frontend:latest
+    ```
+  </Step>
+
+  <Step title="Deploy the services stack">
+    ```bash
+    DB_PASSWORD="your-database-password" ./deploy.sh services
+    ```
+
+    The script prompts for `DB_PASSWORD` if the environment variable is not set. The password is stored in Secrets Manager as `erp-agent/db-password` and injected into the ECS task at runtime — it never appears in plaintext in the task definition.
+  </Step>
+
+  <Step title="Deploy the CI/CD stack">
+    ```bash
+    ./deploy.sh cicd
+    ```
+
+    Copy the `GitHubActionsRoleArn` output:
+
+    ```bash
+    aws cloudformation describe-stacks \
+      --stack-name erp-agent-cicd \
+      --query "Stacks[0].Outputs[?OutputKey=='GitHubActionsRoleArn'].OutputValue" \
+      --output text
+    ```
+
+    Add this ARN as the `AWS_ROLE_ARN` secret in your GitHub repository.
+  </Step>
+</Steps>
+
+<Tip>
+  To deploy all three stacks in sequence, run `./deploy.sh` (or `./deploy.sh all`) with no arguments. Validation runs before any stack is created.
+</Tip>
+
+## GitHub Actions CI/CD
+
+The `.github/workflows/deploy.yml` pipeline has three stages that run in order.
+
+```
+push to dev   →  CI Pipeline  →  deploy-staging
+push to main  →  CI Pipeline  →  deploy-production  →  refresh-tenants
+```
+
+<Tabs>
+  <Tab title="Staging (auto on dev branch)">
+    Triggered automatically when the CI pipeline succeeds on the `dev` branch, or via `workflow_dispatch` with `environment: staging`.
+
+    1. Assumes `AWS_ROLE_ARN` via OIDC (`id-token: write` permission)
+    2. Logs in to ECR
+    3. Fetches the current task definition JSON with `aws ecs describe-task-definition`
+    4. Patches both container images using `jq` and registers a new task definition revision
+    5. Calls `aws ecs update-service --force-new-deployment`
+    6. Waits for `services-stable` (5-minute timeout)
+  </Tab>
+
+  <Tab title="Production (auto on main branch)">
+    Same flow as staging, but targets the production cluster and service. After the service stabilises, a health check hits `GET /health` on the ALB and fails the pipeline if the HTTP response is not `200`.
+
+    ```bash
+    # Manual force-redeploy without a code change
+    aws ecs update-service \
+      --cluster erp-agent-cluster-production \
+      --service erp-agent-service-production \
+      --force-new-deployment
+    ```
+  </Tab>
+
+  <Tab title="Refresh tenants (post-production)">
+    After a successful production deployment, the `refresh-tenants` job scans the `erp-agent-tenants` DynamoDB table for items with `status = "on"` and calls `aws ecs update-service --force-new-deployment` on each tenant's cluster and service so they pick up the new `:latest` image.
+
+    Tenants with `status = "off"` are skipped — they will automatically use the new image when they are started via their `up.sh` script.
+  </Tab>
+</Tabs>
+
+## ECS task environment variables
+
+The task definition injects the following environment variables into the `backend` container. Secrets are fetched from Secrets Manager at task startup and are never written to CloudWatch Logs.
+
+| Variable | Source | Example value |
+|----------|--------|---------------|
+| `DB_HOST` | CloudFormation parameter | `iafinagent.choi0eaq2mr7.us-east-1.rds.amazonaws.com` |
+| `DB_NAME` | CloudFormation parameter | `iafinagent` |
+| `DB_USER` | CloudFormation parameter | `admin` |
+| `DB_PASSWORD` | Secrets Manager | `erp-agent/db-password` |
+| `REDIS_URL` | ElastiCache endpoint | `redis://<endpoint>:6379/0` |
+| `AWS_REGION` | `AWS::Region` | `us-east-1` |
+| `COGNITO_USER_POOL_ID` | CloudFormation parameter | `us-east-1_2qpNBGCmb` |
+| `COGNITO_CLIENT_ID` | CloudFormation parameter | `70qcoifagu4tk20qnn2q8d9rjs` |
+| `BEDROCK_MODEL_ID` | Hardcoded in template | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` |
+| `BEDROCK_REASONING_MODEL_ID` | Hardcoded in template | `us.anthropic.claude-sonnet-5` |
+| `BEDROCK_EMBEDDING_MODEL_ID` | Hardcoded in template | `amazon.titan-embed-text-v2:0` |
+| `DYNAMODB_ENABLED` | Hardcoded | `true` |
+| `EXPECTED_TENANT` | CloudFormation parameter | `*` (primary) or tenant slug |
+| `RBAC_ENFORCE` | CloudFormation parameter | `false` |
+| `LOG_LEVEL` | Hardcoded | `INFO` |
+
+## Validate templates without deploying
+
+```bash
+./deploy.sh validate
+```
+
+Runs `aws cloudformation validate-template` against all three templates and exits non-zero if any are invalid.

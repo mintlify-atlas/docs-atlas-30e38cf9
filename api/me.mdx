@@ -1,0 +1,301 @@
+---
+title: "Identity API — Current User Permissions & Role"
+sidebarTitle: "Me"
+description: "Retrieve the calling user's resolved role, permissions, data modules, and instance access. The single source of truth for frontend access control."
+---
+
+The Identity API exposes a single endpoint — `GET /api/me` — that returns everything the frontend needs to make conditional rendering decisions: the user's effective role, every granted permission key, the list of data modules the agent may query on their behalf, labor-cost restrictions, and the set of tenant instances they can access.
+
+<Note>
+  Client-side gating based on this response is for **UX only**. Every action is independently enforced server-side. Never use `GET /api/me` as a security gate in client code.
+</Note>
+
+---
+
+## Authentication
+
+```http
+Authorization: Bearer <id_token>
+```
+
+A valid Cognito-issued JWT is required. The role and permissions are resolved from the user's Cognito group membership at request time.
+
+---
+
+## GET /api/me
+
+Returns the calling user's resolved `Principal` as a public dictionary. The same shape is embedded in every agent graph state object, so the agent nodes always operate with an up-to-date copy of the caller's access.
+
+### Response — `MeResponse`
+
+<ResponseField name="user_id" type="string" required>
+  Cognito subject (`sub`) — the stable UUID that uniquely identifies the user across all systems. Use this as the canonical user key in DynamoDB records.
+</ResponseField>
+
+<ResponseField name="username" type="string" required>
+  Display username. In most deployments this is the user's email address.
+</ResponseField>
+
+<ResponseField name="email" type="string" required>
+  User's email address.
+</ResponseField>
+
+<ResponseField name="tenant" type="string" required>
+  Tenant identifier assigned to this user (`custom:tenantId`). Determines which deployment instance the user's data queries are routed to. Defaults to `"default"` if unset.
+</ResponseField>
+
+<ResponseField name="role" type="string" required>
+  The user's effective role name, resolved from their Cognito group membership.
+
+  | Value | Description |
+  |-------|-------------|
+  | `platform_admin` | Vendor staff — cross-tenant operations, full access to all instances. |
+  | `org_admin` | Organization administrator — manages users and roles within their tenant. |
+  | `finance_lead` | Finance lead analyst — full read access plus data export. |
+  | `analyst` | Standard analyst — chat queries, visualisations, SQL view. |
+  | `viewer` | Read-only — chat queries only, no SQL or export access. |
+</ResponseField>
+
+<ResponseField name="permissions" type="array" required>
+  Sorted list of atomic permission keys granted to this user. The full set of possible values is listed below.
+
+  <Expandable title="All permission values">
+    | Key | Description |
+    |-----|-------------|
+    | `chat.query` | Submit queries to the Text-to-SQL agent. |
+    | `viz.create` | Request chart and visualisation generation. |
+    | `feedback.submit` | Submit thumbs-up / thumbs-down feedback on answers. |
+    | `sql.view_raw` | View the generated SQL in agent responses. |
+    | `data.export` | Download query results as Excel or CSV. |
+    | `file.upload` | Upload Excel/CSV files for ad-hoc analysis. |
+    | `history.view_all` | View conversation history for all users (not just own). |
+    | `admin.users.read` | Read user list and user details in the admin panel. |
+    | `admin.users.write` | Create, update, disable, and delete users. |
+    | `admin.audit.read` | Read the admin audit log. |
+    | `admin.rbac.assign` | Change a user's role or data module overrides. |
+    | `platform.manage` | Cross-tenant platform-level operations (vendor only). |
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="modules" type="array" required>
+  Sorted list of data module slugs the agent is allowed to query for this user. The effective set is computed as `(role_base ∪ modules_added) − modules_removed` from DynamoDB overrides.
+
+  <Expandable title="All module values">
+    | Slug | Business domain |
+    |------|----------------|
+    | `ingresos` | Sales and invoicing (revenue). |
+    | `costos` | Cost centres, cost of sales, and profitability. |
+    | `nomina` | Payroll — add-on to `costos`; exposes *Costos Mano de Obra* accounts. |
+    | `presupuestos` | Budget vs. actuals. |
+    | `pagos` | Payment gateway transactions (BREB, Rappi, Redeban, etc.). |
+    | `produccion` | Manufacturing orders and unit production cost. |
+    | `compras` | Purchase orders, procurement history, and delivery plans. |
+    | `inventario` | Material documents and stock movements. |
+    | `logistica` | Transport documents and delivery stages. |
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="labor_cost_restricted" type="boolean" required>
+  `true` when the user has the `costos` module but **not** the `nomina` add-on. When `true`, the schema linker and SQL validator hide all *Costos Mano de Obra* account lines from generated queries and responses.
+</ResponseField>
+
+<ResponseField name="admin_panel" type="boolean" required>
+  `true` only on the primary instance (where `expected_tenant == "*"`). The frontend uses this flag to show or hide the admin panel navigation link. The admin plane does not exist on tenant-specific deployments — see dev-log/037.
+</ResponseField>
+
+<ResponseField name="allowed_cebes" type="array" required>
+  List of centro de beneficio codes the user's queries are restricted to (`custom:data_scope`). An **empty array** means no row-level restriction — the user sees all cebes. A non-empty array causes the SQL generator to automatically add a `WHERE centro_beneficio IN (...)` clause.
+</ResponseField>
+
+<ResponseField name="allowed_tenants" type="array" required>
+  Additional instance slugs the user is authorised to access beyond their home tenant (`custom:tenants`). A `platform_admin` can access all instances regardless of this list.
+</ResponseField>
+
+---
+
+### Example
+
+<CodeGroup>
+```bash cURL
+curl -X GET https://api.example.com/api/me \
+  -H "Authorization: Bearer <id_token>"
+```
+
+```json Response — finance_lead
+{
+  "user_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "username": "ana.garcia@empresa.com",
+  "email": "ana.garcia@empresa.com",
+  "tenant": "empresa-sa",
+  "role": "finance_lead",
+  "permissions": [
+    "chat.query",
+    "data.export",
+    "feedback.submit",
+    "file.upload",
+    "sql.view_raw",
+    "viz.create"
+  ],
+  "modules": [
+    "costos",
+    "ingresos",
+    "nomina",
+    "pagos",
+    "presupuestos"
+  ],
+  "labor_cost_restricted": false,
+  "admin_panel": false,
+  "allowed_cebes": [],
+  "allowed_tenants": []
+}
+```
+
+```json Response — analyst (restricted)
+{
+  "user_id": "b9c8d7e6-f5a4-3210-fedc-ba9876543210",
+  "username": "juan.perez@empresa.com",
+  "email": "juan.perez@empresa.com",
+  "tenant": "empresa-sa",
+  "role": "analyst",
+  "permissions": [
+    "chat.query",
+    "feedback.submit",
+    "sql.view_raw",
+    "viz.create"
+  ],
+  "modules": [
+    "costos",
+    "ingresos"
+  ],
+  "labor_cost_restricted": true,
+  "admin_panel": false,
+  "allowed_cebes": ["1000", "2000", "3500"],
+  "allowed_tenants": []
+}
+```
+
+```json Response — platform_admin
+{
+  "user_id": "f1e2d3c4-b5a6-7890-1234-567890abcdef",
+  "username": "admin@vendor.io",
+  "email": "admin@vendor.io",
+  "tenant": "default",
+  "role": "platform_admin",
+  "permissions": [
+    "admin.audit.read",
+    "admin.rbac.assign",
+    "admin.users.read",
+    "admin.users.write",
+    "chat.query",
+    "data.export",
+    "feedback.submit",
+    "file.upload",
+    "history.view_all",
+    "platform.manage",
+    "sql.view_raw",
+    "viz.create"
+  ],
+  "modules": [
+    "compras",
+    "costos",
+    "ingresos",
+    "inventario",
+    "logistica",
+    "nomina",
+    "pagos",
+    "presupuestos",
+    "produccion"
+  ],
+  "labor_cost_restricted": false,
+  "admin_panel": true,
+  "allowed_cebes": [],
+  "allowed_tenants": []
+}
+```
+</CodeGroup>
+
+---
+
+## GET /api/admin/roles
+
+Returns the full role catalog, including pre-designed inactive roles. Requires `admin.users.read` permission.
+
+### Response — `RoleCatalogResponse`
+
+<ResponseField name="roles" type="array" required>
+  List of role definitions, sorted by `rank` descending (highest authority first).
+
+  <Expandable title="RoleInfo fields">
+    <ResponseField name="name" type="string" required>Role slug (e.g. `finance_lead`).</ResponseField>
+    <ResponseField name="description" type="string" required>Human-readable description of the role's purpose.</ResponseField>
+    <ResponseField name="rank" type="integer" required>Authority level. Higher values indicate more authority and are used to enforce management hierarchies.</ResponseField>
+    <ResponseField name="active" type="boolean" required>`true` if this role is currently in use. Pre-designed roles ship as `false`.</ResponseField>
+    <ResponseField name="permissions" type="array" required>Sorted list of permission keys granted by this role.</ResponseField>
+    <ResponseField name="modules" type="array" required>Sorted list of data module slugs granted by this role.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="all_permissions" type="array" required>
+  Sorted list of every permission key defined in the system, regardless of role assignment.
+</ResponseField>
+
+<ResponseField name="all_modules" type="array" required>
+  Sorted list of every module slug defined in the system.
+</ResponseField>
+
+<CodeGroup>
+```bash cURL
+curl -X GET https://api.example.com/api/admin/roles \
+  -H "Authorization: Bearer <id_token>"
+```
+
+```json Response
+{
+  "roles": [
+    {
+      "name": "platform_admin",
+      "description": "Vendor staff with cross-tenant access.",
+      "rank": 100,
+      "active": true,
+      "permissions": ["admin.audit.read", "admin.rbac.assign", "admin.users.read", "admin.users.write", "chat.query", "data.export", "feedback.submit", "file.upload", "history.view_all", "platform.manage", "sql.view_raw", "viz.create"],
+      "modules": ["compras", "costos", "ingresos", "inventario", "logistica", "nomina", "pagos", "presupuestos", "produccion"]
+    },
+    {
+      "name": "org_admin",
+      "description": "Organization administrator managing users within their tenant.",
+      "rank": 80,
+      "active": true,
+      "permissions": ["admin.audit.read", "admin.rbac.assign", "admin.users.read", "admin.users.write", "chat.query", "data.export", "feedback.submit", "history.view_all", "sql.view_raw", "viz.create"],
+      "modules": ["compras", "costos", "ingresos", "inventario", "logistica", "nomina", "pagos", "presupuestos", "produccion"]
+    },
+    {
+      "name": "viewer",
+      "description": "Read-only access to chat queries.",
+      "rank": 10,
+      "active": true,
+      "permissions": ["chat.query", "feedback.submit"],
+      "modules": ["ingresos"]
+    }
+  ],
+  "all_permissions": [
+    "admin.audit.read", "admin.rbac.assign", "admin.users.read", "admin.users.write",
+    "chat.query", "data.export", "feedback.submit", "file.upload",
+    "history.view_all", "platform.manage", "sql.view_raw", "viz.create"
+  ],
+  "all_modules": [
+    "compras", "costos", "ingresos", "inventario",
+    "logistica", "nomina", "pagos", "presupuestos", "produccion"
+  ]
+}
+```
+</CodeGroup>
+
+---
+
+## Error Reference
+
+| Status | Condition |
+|--------|-----------|
+| `401 Unauthorized` | Missing or expired JWT. |
+| `403 Forbidden` | Valid JWT but insufficient permissions (e.g. calling `/api/admin/roles` without `admin.users.read`). |
+| `429 Too Many Requests` | Rate limit exceeded. |

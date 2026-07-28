@@ -1,0 +1,276 @@
+---
+title: "Schema Exploration API — Browse & Search Tables"
+sidebarTitle: "Schema"
+description: "Discover, inspect, and semantically search the ERP database schema. List tables, retrieve column-level detail, and run FAISS-powered natural-language table search."
+---
+
+The Schema Exploration API lets authenticated users browse the ERP's registered tables, retrieve full column metadata and DDL, and search for relevant tables using natural-language queries. All three endpoints share the same rate-limit tier as the chat API and require a valid Bearer JWT.
+
+<Note>
+  All schema endpoints are subject to the same rate limit as the chat endpoint. Exceeding the limit returns `429 Too Many Requests`.
+</Note>
+
+---
+
+## Authentication
+
+Every request must include an `Authorization` header with a Cognito-issued JWT.
+
+```http
+Authorization: Bearer <id_token>
+```
+
+---
+
+## GET /schema/tables
+
+Returns a sorted list of every table registered in the schema registry, grouped first by `table_type` and then alphabetically by name.
+
+### Response — `TableListResponse`
+
+<ResponseField name="tables" type="array" required>
+  Array of table summary objects, sorted by `(table_type, table_name)`.
+
+  <Expandable title="Table summary object fields">
+    <ResponseField name="table_name" type="string" required>
+      The physical table or view name in the ERP database.
+    </ResponseField>
+    <ResponseField name="table_type" type="string" required>
+      Classifier for the table: `dimension`, `fact`, or `view`.
+    </ResponseField>
+    <ResponseField name="description" type="string" required>
+      Plain-language business description of what the table contains.
+    </ResponseField>
+    <ResponseField name="row_count" type="integer" required>
+      Approximate row count sourced from the schema registry metadata.
+    </ResponseField>
+    <ResponseField name="column_count" type="integer" required>
+      Number of columns in the table.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="total" type="integer" required>
+  Total number of tables returned.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+```bash cURL
+curl -X GET https://api.example.com/schema/tables \
+  -H "Authorization: Bearer <id_token>"
+```
+
+```json Response
+{
+  "tables": [
+    {
+      "table_name": "dim_centro_beneficio",
+      "table_type": "dimension",
+      "description": "Centros de beneficio (cebes) del plan organizacional.",
+      "row_count": 120,
+      "column_count": 6
+    },
+    {
+      "table_name": "fact_ventas",
+      "table_type": "fact",
+      "description": "Líneas de factura de ventas con montos, impuestos y unidades.",
+      "row_count": 4800000,
+      "column_count": 22
+    }
+  ],
+  "total": 2
+}
+```
+</CodeGroup>
+
+---
+
+## GET /schema/tables/\{table_name\}
+
+Returns full metadata for a single table, including every column's name, type, and description, plus the original DDL statement and any business usage notes recorded in the registry.
+
+### Path Parameters
+
+<ParamField path="table_name" type="string" required>
+  The exact table name as it appears in the schema registry (case-sensitive).
+</ParamField>
+
+### Response — `TableDetailResponse`
+
+<ResponseField name="table_name" type="string" required>
+  The physical table name.
+</ResponseField>
+<ResponseField name="table_type" type="string" required>
+  `dimension`, `fact`, or `view`.
+</ResponseField>
+<ResponseField name="description" type="string" required>
+  Business description of the table.
+</ResponseField>
+<ResponseField name="row_count" type="integer" required>
+  Approximate row count from the registry.
+</ResponseField>
+<ResponseField name="columns" type="array" required>
+  List of column-level metadata objects.
+
+  <Expandable title="Column object fields">
+    <ResponseField name="column_name" type="string" required>
+      Column name as defined in the DDL.
+    </ResponseField>
+    <ResponseField name="data_type" type="string" required>
+      SQL data type (e.g., `VARCHAR`, `DECIMAL`, `DATE`).
+    </ResponseField>
+    <ResponseField name="description" type="string">
+      Business description of the column's contents.
+    </ResponseField>
+    <ResponseField name="nullable" type="boolean">
+      Whether the column allows `NULL` values.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="ddl" type="string">
+  The `CREATE TABLE` statement for the table, if available.
+</ResponseField>
+<ResponseField name="business_notes" type="string">
+  Free-form notes recorded by schema owners about business logic or caveats.
+</ResponseField>
+
+### Error Responses
+
+| Status | Condition |
+|--------|-----------|
+| `404 Not Found` | No table with the given `table_name` exists in the registry. |
+| `401 Unauthorized` | Missing or invalid JWT. |
+| `429 Too Many Requests` | Rate limit exceeded. |
+
+### Example
+
+<CodeGroup>
+```bash cURL
+curl -X GET https://api.example.com/schema/tables/fact_ventas \
+  -H "Authorization: Bearer <id_token>"
+```
+
+```json Response
+{
+  "table_name": "fact_ventas",
+  "table_type": "fact",
+  "description": "Líneas de factura de ventas con montos, impuestos y unidades.",
+  "row_count": 4800000,
+  "columns": [
+    {
+      "column_name": "id_venta",
+      "data_type": "INT",
+      "description": "Surrogate key de la línea de venta.",
+      "nullable": false
+    },
+    {
+      "column_name": "fecha_factura",
+      "data_type": "DATE",
+      "description": "Fecha de emisión de la factura.",
+      "nullable": false
+    },
+    {
+      "column_name": "monto_neto",
+      "data_type": "DECIMAL(18,2)",
+      "description": "Monto neto sin impuestos.",
+      "nullable": true
+    }
+  ],
+  "ddl": "CREATE TABLE fact_ventas (\n  id_venta INT NOT NULL,\n  fecha_factura DATE NOT NULL,\n  monto_neto DECIMAL(18,2)\n);",
+  "business_notes": "Use fecha_factura for period filters. Join to dim_centro_beneficio on id_cebe."
+}
+```
+
+```json 404 Not Found
+{
+  "detail": "Table 'fact_xyz' not found"
+}
+```
+</CodeGroup>
+
+---
+
+## POST /schema/search
+
+Performs a semantic similarity search over all registered table descriptions using a FAISS vector index. Returns the most relevant tables for a natural-language query, which is useful for discovering which tables to query before writing a prompt.
+
+### Request Body — `TableSearchRequest`
+
+<ParamField body="query" type="string" required>
+  Natural-language search query, e.g. `"monthly revenue by cost center"`. Must be between 1 and 500 characters.
+</ParamField>
+
+<ParamField body="top_k" type="integer" default="5">
+  Number of results to return. Must be between `1` and `20` (inclusive).
+</ParamField>
+
+### Response — `TableSearchResponse`
+
+<ResponseField name="results" type="array" required>
+  Matched tables ranked by semantic relevance.
+
+  <Expandable title="Result object fields">
+    <ResponseField name="table_name" type="string" required>
+      Name of the matched table.
+    </ResponseField>
+    <ResponseField name="table_type" type="string" required>
+      `dimension`, `fact`, or `view`.
+    </ResponseField>
+    <ResponseField name="row_count" type="integer" required>
+      Approximate row count of the matched table.
+    </ResponseField>
+    <ResponseField name="snippet" type="string" required>
+      First 200 characters of the table's description document used for vector matching.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="query" type="string" required>
+  Echo of the original search query as received.
+</ResponseField>
+
+<Tip>
+  Use the `snippet` field to quickly verify relevance before fetching full column metadata via `GET /schema/tables/{table_name}`.
+</Tip>
+
+### Example
+
+<CodeGroup>
+```bash cURL
+curl -X POST https://api.example.com/schema/search \
+  -H "Authorization: Bearer <id_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "monthly revenue by cost center",
+    "top_k": 3
+  }'
+```
+
+```json Response
+{
+  "results": [
+    {
+      "table_name": "fact_ventas",
+      "table_type": "fact",
+      "row_count": 4800000,
+      "snippet": "Líneas de factura de ventas con montos, impuestos y unidades vendidas por centro de beneficio y período."
+    },
+    {
+      "table_name": "fact_ingresos_mensual",
+      "table_type": "fact",
+      "row_count": 95000,
+      "snippet": "Resumen mensual de ingresos consolidados por cebe y línea de negocio."
+    },
+    {
+      "table_name": "dim_centro_beneficio",
+      "table_type": "dimension",
+      "row_count": 120,
+      "snippet": "Centros de beneficio (cebes) del plan organizacional con jerarquía, región y tipo."
+    }
+  ],
+  "query": "monthly revenue by cost center"
+}
+```
+</CodeGroup>

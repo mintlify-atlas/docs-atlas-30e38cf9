@@ -1,0 +1,336 @@
+---
+title: "Chat API — POST /chat, GET /health, GET /metrics"
+sidebarTitle: "Chat REST API"
+description: "POST natural language questions to the ERP Financial Agent, handle HITL confirmation flows, and check service health and Prometheus metrics."
+---
+
+The REST Chat API is the synchronous interface to the ERP Financial Agent pipeline. Each `POST /chat` request runs the full LangGraph pipeline — schema linking, SQL generation, execution, and analysis — and returns a complete structured response. For streaming progress events while the pipeline runs, use the [WebSocket API](/api/websocket) instead.
+
+## Authentication
+
+All `/chat` requests require an `Authorization` header containing a Bearer JWT token issued by **AWS Cognito**. The backend validates the token's signature against your Cognito User Pool's JWKS endpoint, checks the issuer, and (when configured) validates the audience against `COGNITO_CLIENT_ID`.
+
+```
+Authorization: Bearer <cognito_id_token>
+```
+
+Obtain tokens via [AWS Amplify](https://docs.amplify.aws/lib/auth/getting-started/) on the frontend or directly through the Cognito token endpoint. The backend does **not** expose a token-generation endpoint.
+
+<Note>
+  The authenticated user's identity is derived from the JWT `sub` claim. The `cognito:groups`, `custom:tenantId`, and `custom:data_scope` claims drive RBAC and multi-tenant data isolation — ensure your Cognito User Pool attributes are configured accordingly.
+</Note>
+
+## Rate Limiting
+
+Rate limiting is enforced **per authenticated user** (keyed on `user_id` from the JWT). Unauthenticated requests fall back to IP-based limiting.
+
+| Window | Limit |
+|--------|-------|
+| Per minute | 20 requests |
+| Per hour | 200 requests |
+
+When the limit is exceeded the API returns `429 Too Many Requests`. The `Retry-After` header indicates when the window resets.
+
+---
+
+## POST /chat
+
+Process a natural language question through the full agent pipeline and return a structured response with narrative text, generated SQL, optional visualisation config, KPIs, and download links.
+
+### Request
+
+<ParamField header="Authorization" type="string" required>
+  Bearer JWT token from AWS Cognito.
+  
+  Example: `Bearer eyJraWQ...`
+</ParamField>
+
+<ParamField header="X-Correlation-ID" type="string">
+  Optional trace ID propagated through logs and LangSmith. A UUID is generated automatically if omitted.
+</ParamField>
+
+<ParamField body="message" type="string" required>
+  Natural language question in any language supported by your LLM. Must be between 1 and 2 000 characters.
+
+  Example: `"¿Cuánto vendimos por región en el primer trimestre?"`
+</ParamField>
+
+<ParamField body="session_id" type="string | null">
+  Session identifier for multi-turn conversation history. Must match the pattern `^[a-zA-Z0-9_-]{1,128}$`.
+
+  Omit (or pass `null`) to let the server generate a new UUID session. The assigned session ID is always returned in the response so you can pass it back on the next turn.
+</ParamField>
+
+<ParamField body="confirmed" type="boolean">
+  Human-in-the-loop confirmation flag. Defaults to `false`.
+
+  When the pipeline detects an expensive or ambiguous query it returns `confirmation_required: true` instead of executing. Resend the **identical request body** with `confirmed: true` to proceed.
+</ParamField>
+
+### Response
+
+<ResponseField name="response" type="string" required>
+  Narrative answer in plain text or Markdown. Always present.
+</ResponseField>
+
+<ResponseField name="session_id" type="string" required>
+  Session ID for this conversation. Echo this value in subsequent requests to maintain context.
+</ResponseField>
+
+<ResponseField name="confirmation_required" type="boolean" required>
+  `true` when the pipeline has triggered the Human-in-the-Loop gate. When this is `true`, the other data fields are empty — resend with `confirmed: true` to execute.
+</ResponseField>
+
+<ResponseField name="sql" type="string | null">
+  The SQL query that was generated and executed against the ERP database. `null` for conversational turns that did not require a query.
+</ResponseField>
+
+<ResponseField name="row_count" type="integer | null">
+  Number of rows returned by the SQL query. `null` when no query was executed.
+</ResponseField>
+
+<ResponseField name="intent" type="string | null">
+  Classified top-level intent of the user's message (e.g. `ventas`, `costos`, `general`).
+</ResponseField>
+
+<ResponseField name="analysis_intent" type="string | null">
+  Sub-intent that controls which result components are populated. One of:
+  - `query` — data table only
+  - `chart` — chart + table
+  - `analysis` — full experience: KPIs + chart + table + exports
+</ResponseField>
+
+<ResponseField name="chart_config" type="object | null">
+  <Expandable title="ECharts configuration object">
+    A complete [Apache ECharts](https://echarts.apache.org/) `option` object ready to pass to `echarts.setOption()`. Present when `analysis_intent` is `chart` or `analysis`.
+
+    <ResponseField name="title" type="object">
+      Chart title object with `text` property.
+    </ResponseField>
+    <ResponseField name="xAxis" type="object">
+      X-axis configuration including `data` array for categorical axes.
+    </ResponseField>
+    <ResponseField name="yAxis" type="object">
+      Y-axis configuration.
+    </ResponseField>
+    <ResponseField name="series" type="array">
+      One or more series objects. Type is one of `bar`, `line`, `pie`, `bar` (horizontal with `barCategoryGap`).
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="kpis" type="object | null">
+  <Expandable title="KPI values object">
+    Key performance indicator values extracted from the query results. Shape is dynamic and depends on the data, but commonly includes fields like:
+
+    <ResponseField name="total" type="number">
+      Aggregate total (e.g. total revenue).
+    </ResponseField>
+    <ResponseField name="average" type="number">
+      Mean value across the result set.
+    </ResponseField>
+    <ResponseField name="max" type="number">
+      Maximum value in the result set.
+    </ResponseField>
+    <ResponseField name="min" type="number">
+      Minimum value in the result set.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="executive_summary" type="string | null">
+  Markdown-formatted executive summary of the analysis. Present when `analysis_intent` is `analysis`.
+</ResponseField>
+
+<ResponseField name="exports" type="object | null">
+  <Expandable title="Download links object">
+    Pre-signed download URLs or Base64-encoded file payloads for query results.
+
+    <ResponseField name="csv" type="string">
+      CSV export of the query result rows.
+    </ResponseField>
+    <ResponseField name="xlsx" type="string">
+      Excel export of the query result rows.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="confirmation_message" type="string | null">
+  Human-readable explanation of why confirmation is required (e.g. "This query will scan 5 million rows. Do you want to proceed?"). Only present when `confirmation_required` is `true`.
+</ResponseField>
+
+### Error Responses
+
+| Status | Code | Description |
+|--------|------|-------------|
+| `401 Unauthorized` | — | Missing, expired, or invalid JWT token. |
+| `422 Unprocessable Entity` | — | Request body failed Pydantic validation (e.g. `message` too long, invalid `session_id` format). |
+| `429 Too Many Requests` | — | Rate limit exceeded. Check the `Retry-After` header. |
+| `500 Internal Server Error` | — | Unhandled error in the agent pipeline. The `detail` field contains context. |
+| `503 Service Unavailable` | — | LangGraph pipeline is still initialising at startup. Retry after a few seconds. |
+
+---
+
+## HITL Confirmation Flow
+
+Some queries trigger a **Human-in-the-Loop** gate before execution — for example, queries that scan large tables or perform destructive-looking aggregations. The flow is:
+
+<Steps>
+  <Step title="Send your question normally">
+    POST to `/chat` with `confirmed` omitted or set to `false`.
+  </Step>
+  <Step title="Receive a confirmation prompt">
+    The response has `confirmation_required: true` and a `confirmation_message` explaining what the agent wants to do. No SQL has been executed yet.
+  </Step>
+  <Step title="Confirm and execute">
+    Resend the **same `message` and `session_id`** with `confirmed: true`. The pipeline will proceed to SQL execution.
+  </Step>
+</Steps>
+
+<Warning>
+  Always preserve the same `session_id` when confirming a HITL gate. Sending a different session or omitting it creates a new session and the pipeline will not recognise the pending confirmation.
+</Warning>
+
+---
+
+## Code Examples
+
+<CodeGroup>
+
+```bash cURL
+# Basic chat request
+curl -X POST https://api.example.com/chat \
+  -H "Authorization: Bearer $COGNITO_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "¿Cuánto vendimos por región en el primer trimestre?",
+    "session_id": "session-abc123"
+  }'
+
+# Confirm a HITL gate
+curl -X POST https://api.example.com/chat \
+  -H "Authorization: Bearer $COGNITO_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "¿Cuánto vendimos por región en el primer trimestre?",
+    "session_id": "session-abc123",
+    "confirmed": true
+  }'
+```
+
+```python Python (httpx)
+import httpx
+import asyncio
+
+BASE_URL = "https://api.example.com"
+TOKEN = "eyJraWQ..."  # JWT from AWS Cognito
+
+async def chat(message: str, session_id: str | None = None, confirmed: bool = False) -> dict:
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{BASE_URL}/chat",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+            json={
+                "message": message,
+                "session_id": session_id,
+                "confirmed": confirmed,
+            },
+            timeout=60.0,
+        )
+        response.raise_for_status()
+        return response.json()
+
+async def main():
+    # Start a new session
+    result = await chat("¿Cuánto vendimos por región en el primer trimestre?")
+    session_id = result["session_id"]
+    print(f"Session: {session_id}")
+
+    # Handle HITL gate if triggered
+    if result["confirmation_required"]:
+        print(f"Confirmation needed: {result['confirmation_message']}")
+        user_input = input("Proceed? (y/n): ")
+        if user_input.lower() == "y":
+            result = await chat(
+                "¿Cuánto vendimos por región en el primer trimestre?",
+                session_id=session_id,
+                confirmed=True,
+            )
+
+    print(result["response"])
+
+    # Continue the conversation in the same session
+    follow_up = await chat(
+        "¿Y el segundo trimestre?",
+        session_id=session_id,
+    )
+    print(follow_up["response"])
+
+asyncio.run(main())
+```
+
+</CodeGroup>
+
+---
+
+## GET /health
+
+Returns service health status. No authentication required. Suitable for load balancer health checks and uptime monitors.
+
+### Response
+
+<ResponseField name="status" type="string" required>
+  `"healthy"` when the database is reachable, `"degraded"` otherwise.
+</ResponseField>
+
+<ResponseField name="database" type="string" required>
+  `"connected"` or `"disconnected"` based on a live connectivity check against the MySQL RDS instance.
+</ResponseField>
+
+<ResponseField name="environment" type="string" required>
+  The current deployment environment (e.g. `"production"`, `"staging"`, `"development"`).
+</ResponseField>
+
+<ResponseField name="langsmith_enabled" type="boolean" required>
+  `true` when LangSmith tracing is active. Reflects both `LANGSMITH_API_KEY` being set and `LANGCHAIN_TRACING_V2=true`.
+</ResponseField>
+
+<ResponseField name="metrics_enabled" type="boolean" required>
+  `true` when Prometheus metrics collection is enabled.
+</ResponseField>
+
+### Example
+
+```bash
+curl https://api.example.com/health
+```
+
+```json
+{
+  "status": "healthy",
+  "database": "connected",
+  "environment": "production",
+  "langsmith_enabled": true,
+  "metrics_enabled": true
+}
+```
+
+---
+
+## GET /metrics
+
+Returns Prometheus-compatible plain-text metrics for scraping. No authentication required — restrict access at the network/load-balancer level in production.
+
+<Tip>
+  The `/metrics` endpoint exposes the Prometheus exposition format (`text/plain; charset=utf-8`). Add it as a scrape target in your `prometheus.yml`:
+
+  ```yaml
+  scrape_configs:
+    - job_name: erp_agent
+      static_configs:
+        - targets: ["api:8000"]
+      metrics_path: /metrics
+  ```
+</Tip>
+
+Key metrics exposed include HTTP request totals (method × endpoint × status code) and active WebSocket session counts.

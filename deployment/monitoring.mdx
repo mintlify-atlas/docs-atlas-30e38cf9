@@ -1,0 +1,328 @@
+---
+title: "Monitoring, Metrics, and Observability"
+sidebarTitle: "Monitoring"
+description: "Observe ERP Financial Agent with Prometheus metrics, Grafana dashboards, LangSmith LLM tracing, cost tracking per user and node, and structured logging."
+---
+
+The ERP Financial Agent exposes a rich observability surface: a Prometheus `/metrics` endpoint that tracks LLM latency, token consumption, SQL execution, and HTTP traffic; a Grafana dashboard provisioned automatically from `monitoring/grafana/dashboards/erp-agent.json`; LangSmith trace integration for every LangGraph invocation; per-user and per-node cost accounting backed by Redis and DynamoDB; and structured JSON logs with correlation IDs via `structlog`. All components can be started locally with a single Compose command.
+
+## Starting the monitoring stack
+
+```bash
+docker compose -f monitoring/docker-compose.monitoring.yml up
+```
+
+This starts two containers:
+
+| Service | Image | Host port |
+|---------|-------|-----------|
+| Prometheus | `prom/prometheus:v2.51.0` | 9090 |
+| Grafana | `grafana/grafana:10.4.0` | 3000 |
+
+Prometheus scrapes the backend at `host.docker.internal:8000/metrics` every 15 seconds and retains data for 15 days (`--storage.tsdb.retention.time=15d`). Grafana is provisioned automatically with a Prometheus data source and the ERP Agent dashboard.
+
+<Note>
+  Default Grafana credentials are `admin` / `admin`. Self-registration is disabled (`GF_USERS_ALLOW_SIGN_UP=false`). Change the password immediately after first login in any non-local environment.
+</Note>
+
+## Prometheus metrics
+
+All metrics are registered under the prefix `erp_agent_` (configured by `settings.metrics_prefix` in `src/observability/metrics.py`). The scrape endpoint is `GET /metrics`.
+
+### HTTP traffic
+
+```
+erp_agent_http_requests_total
+  Labels: method, endpoint, status_code
+  Type:   Counter
+  Desc:   Total HTTP requests received
+```
+
+**Example query — requests per second by endpoint:**
+
+```promql
+rate(erp_agent_http_requests_total[5m])
+```
+
+### LLM metrics
+
+```
+erp_agent_llm_request_duration_seconds
+  Labels: model, node
+  Type:   Histogram
+  Buckets: 0.5, 1, 2, 5, 10, 20, 30, 60 s
+  Desc:   LLM API call duration in seconds
+
+erp_agent_llm_tokens_total
+  Labels: model, token_type
+  Type:   Counter
+  Desc:   Total LLM tokens consumed (prompt / completion)
+
+erp_agent_node_execution_duration_seconds
+  Labels: node_name
+  Type:   Histogram
+  Buckets: 0.1, 0.5, 1, 2, 5, 10, 30 s
+  Desc:   LangGraph node execution duration
+
+erp_agent_graph_invocations_total
+  Labels: intent, success
+  Type:   Counter
+  Desc:   Total graph invocations
+```
+
+### SQL metrics
+
+```
+erp_agent_sql_execution_duration_seconds
+  Type:   Histogram
+  Buckets: 0.1, 0.5, 1, 2, 5, 10, 30 s
+  Desc:   SQL query execution duration
+
+erp_agent_sql_validation_total
+  Labels: layer, result
+  Type:   Counter
+  Desc:   SQL validations by layer and result
+
+erp_agent_sql_validation_errors_total
+  Labels: error_type
+  Type:   Counter
+  Desc:   SQL validation errors by error type
+
+erp_agent_sql_correction_attempts_total
+  Type:   Counter
+  Desc:   Total SQL self-correction attempts
+
+erp_agent_schema_link_tables_count
+  Buckets: 1, 2, 3, 5, 8, 10, 15
+  Type:   Histogram
+  Desc:   Number of tables matched by the schema linker
+```
+
+### Errors and sessions
+
+```
+erp_agent_errors_total
+  Labels: error_type, node
+  Type:   Counter
+  Desc:   Total errors by type and originating node
+
+erp_agent_active_sessions
+  Type:   Gauge
+  Desc:   Number of active sessions
+```
+
+## Prometheus configuration
+
+`monitoring/prometheus/prometheus.yml`:
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alert_rules.yml
+
+scrape_configs:
+  - job_name: erp-financial-agent
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - host.docker.internal:8000
+        labels:
+          service: erp-agent
+          environment: development
+```
+
+<Note>
+  For production, replace `host.docker.internal:8000` with the ALB DNS or the ECS service discovery endpoint. On ECS Fargate with Container Insights enabled, consider using the AWS Managed Prometheus (AMP) remote-write integration instead of self-hosted Prometheus.
+</Note>
+
+## Alert rules
+
+Four alert rules are defined in `monitoring/prometheus/alert_rules.yml`:
+
+<Accordion title="HighLatency — P95 LLM latency > 15 s">
+  ```yaml
+  alert: HighLatency
+  expr: >
+    histogram_quantile(0.95,
+      rate(erp_agent_llm_request_duration_seconds_bucket[5m])
+    ) > 15
+  for: 2m
+  labels:
+    severity: warning
+  annotations:
+    summary: High LLM latency detected
+    description: "P95 LLM latency is {{ $value }}s (threshold: 15s)"
+  ```
+  Fires if the 95th-percentile LLM call duration exceeds 15 seconds for at least 2 minutes. Indicates model cold starts, network latency to Bedrock, or unusually large prompts.
+</Accordion>
+
+<Accordion title="HighErrorRate — error rate > 10 %">
+  ```yaml
+  alert: HighErrorRate
+  expr: >
+    rate(erp_agent_errors_total[5m]) /
+    rate(erp_agent_http_requests_total[5m]) > 0.10
+  for: 2m
+  labels:
+    severity: critical
+  annotations:
+    summary: High error rate detected
+    description: "Error rate is {{ $value | humanizePercentage }} (threshold: 10%)"
+  ```
+  Fires when more than 10% of requests result in errors for 2 consecutive minutes. `severity: critical` — page immediately.
+</Accordion>
+
+<Accordion title="HighTokenUsage — > 100 k tokens / hour">
+  ```yaml
+  alert: HighTokenUsage
+  expr: rate(erp_agent_llm_tokens_total[1h]) > 100000
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: High token consumption rate
+    description: "Token consumption rate: {{ $value }} tokens/hour"
+  ```
+  Fires when token consumption rate sustains above 100,000 tokens/hour for 5 minutes. Monitor for runaway loops or unexpectedly verbose user sessions.
+</Accordion>
+
+<Accordion title="HighSQLLatency — P95 SQL > 10 s">
+  ```yaml
+  alert: HighSQLLatency
+  expr: >
+    histogram_quantile(0.95,
+      rate(erp_agent_sql_execution_duration_seconds_bucket[5m])
+    ) > 10
+  for: 2m
+  labels:
+    severity: warning
+  annotations:
+    summary: High SQL execution latency
+    description: "P95 SQL latency is {{ $value }}s (threshold: 10s)"
+  ```
+  Fires when the 95th-percentile SQL execution time exceeds 10 seconds for 2 minutes. Indicates missing indexes, long-running aggregations, or RDS instance saturation.
+</Accordion>
+
+## Grafana dashboard
+
+Grafana is provisioned from `monitoring/grafana/provisioning/dashboards.yml`:
+
+```yaml
+apiVersion: 1
+providers:
+  - name: default
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
+```
+
+The dashboard JSON (`monitoring/grafana/dashboards/erp-agent.json`) is mounted read-only at startup. Access Grafana at `http://localhost:3000` and look for the **ERP Agent** dashboard on the home page.
+
+## LLM cost tracking
+
+`src/observability/cost_tracker.py` implements a `CostTracker` singleton that accumulates token usage — broken down by user, session, and LangGraph node — and persists state to Redis (90-day TTL) and DynamoDB (permanent backup) every 10 LLM calls.
+
+**Cost calculation** uses separate rates for standard and reasoning models (Anthropic Opus-class models are detected by the `opus` substring in the model ID):
+
+```python
+def _compute_call_cost(prompt_tokens, completion_tokens, model=""):
+    is_reasoning = "opus" in model.lower()
+    input_rate = (settings.cost_per_1k_input_tokens_reasoning
+                  if is_reasoning else settings.cost_per_1k_input_tokens)
+    output_rate = (settings.cost_per_1k_output_tokens_reasoning
+                   if is_reasoning else settings.cost_per_1k_output_tokens)
+    return (prompt_tokens / 1000) * input_rate + (completion_tokens / 1000) * output_rate
+```
+
+**Admin API endpoints:**
+
+```bash
+# Global cost summary
+GET /api/admin/costs
+
+# Per-user breakdown (sorted by cost, descending)
+GET /api/admin/costs/users
+
+# Per-node breakdown
+GET /api/admin/costs/nodes
+```
+
+Example response for `GET /api/admin/costs`:
+
+```json
+{
+  "total_tokens": 1482300,
+  "prompt_tokens": 982000,
+  "completion_tokens": 500300,
+  "call_count": 347,
+  "estimated_cost_usd": 4.21,
+  "total_duration_seconds": 1842.5
+}
+```
+
+<Tip>
+  Cost context (user and session) is injected into the tracker via `set_cost_context(user_id, session_id)` in the API layer before each graph invocation. This ensures costs are attributed correctly even when requests arrive concurrently.
+</Tip>
+
+## LangSmith tracing
+
+LangSmith tracing is configured in `src/observability/langsmith.py` and must be enabled before the LangGraph graph or any LLM client is instantiated.
+
+**Required environment variables:**
+
+| Variable | Description |
+|----------|-------------|
+| `LANGSMITH_API_KEY` | Your LangSmith API key |
+| `LANGCHAIN_TRACING_V2` | Set to `true` to enable tracing |
+| `LANGSMITH_PROJECT` | Project name in LangSmith (default: `erp-financial-agent`) |
+
+**How it works:**
+
+```python
+def configure_langsmith() -> None:
+    settings = get_settings()
+    if not settings.langsmith_api_key:
+        logger.info("LangSmith tracing disabled (no API key)")
+        return
+    os.environ["LANGCHAIN_TRACING_V2"] = str(settings.langchain_tracing_v2).lower()
+    os.environ["LANGCHAIN_API_KEY"] = settings.langsmith_api_key
+    os.environ["LANGCHAIN_PROJECT"] = settings.langsmith_project
+```
+
+When tracing is enabled, every LangGraph node invocation — SQL generation, schema linking, validation, self-correction — appears as a named span in LangSmith under the `erp-financial-agent` project. You can replay failed conversations, inspect token counts per node, and compare latencies across model versions.
+
+<Warning>
+  Tracing sends prompt and completion text to LangSmith. For tenants with strict data-residency requirements, either disable tracing (`LANGCHAIN_TRACING_V2=false`) or use LangSmith's self-hosted option.
+</Warning>
+
+## Structured logging
+
+The backend uses `structlog` for all application logs. Every log entry includes:
+
+- `timestamp` — ISO 8601
+- `level` — `debug`, `info`, `warning`, `error`
+- `logger` — module name (e.g., `src.api.main`)
+- `correlation_id` — injected per request by the FastAPI middleware
+- `tenant` — the `EXPECTED_TENANT` value for the instance
+- `user_id` — when available from the Cognito JWT
+
+Log groups in CloudWatch:
+- `/ecs/erp-agent/backend` (14-day retention)
+- `/ecs/erp-agent/frontend` (14-day retention)
+
+**Query backend errors in CloudWatch Logs Insights:**
+
+```sql
+fields @timestamp, level, message, error_type, user_id
+| filter level = "error"
+| sort @timestamp desc
+| limit 50
+```

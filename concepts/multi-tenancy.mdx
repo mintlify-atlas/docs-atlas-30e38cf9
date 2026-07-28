@@ -1,0 +1,199 @@
+---
+title: "Multi-Tenancy: Isolated ECS Deployments per Customer"
+sidebarTitle: "Multi-Tenancy"
+description: "How the ERP agent isolates each customer in its own ECS service with a dedicated MySQL schema, and how cross-instance access is managed via Cognito and DynamoDB."
+---
+
+The ERP Financial Agent uses a **deployment-level isolation** model: every customer (tenant) runs as a completely separate ECS service with its own FastAPI backend, its own MySQL database connection, and its own Cognito group. There is no shared query path between tenants. A single **primary instance** hosts the admin plane and the tenant registry; all other instances are isolated customer deployments.
+
+## Tenant Model
+
+Each tenant maps to:
+
+| Resource | Naming Convention |
+|---|---|
+| ECS cluster | `erp-agent-cluster-{tenant_id}` |
+| ECS service | `erp-agent-service-{tenant_id}` |
+| RDS instance | `erp-rds-{tenant_id}` (or custom `rds_identifier` in registry) |
+| Cognito group | `{tenant_id}` (slug, lowercase alphanumeric + hyphens) |
+| DynamoDB registry entry | `erp-agent-tenants` table, PK `tenant_id` |
+
+Tenant IDs must match `^[a-z0-9][a-z0-9-]{1,30}$` and cannot be `production` or `staging` (reserved).
+
+---
+
+## Primary Instance vs Tenant Instances
+
+Every deployment carries an `expected_tenant` setting that controls which users may connect:
+
+<CardGroup cols={2}>
+  <Card title='expected_tenant = "*"' icon="star">
+    **Primary instance.** Any authenticated user may connect. This is where the admin panel lives — tenant provisioning, user management, RBAC assignment, and the tenant registry are only available here.
+  </Card>
+  <Card title='expected_tenant = "acme"' icon="building">
+    **Tenant instance.** Only users whose `custom:tenantId` Cognito attribute equals `"acme"` — or whose `allowed_tenants` includes `"acme"` — may connect. Requests from users on other tenants are rejected with HTTP 403.
+  </Card>
+</CardGroup>
+
+Access check logic in `Principal.can_access_instance()`:
+
+```python
+def can_access_instance(self, expected_tenant: str) -> bool:
+    if expected_tenant == "*":
+        return True                                  # primary: everyone
+    if self.role == RoleName.PLATFORM_ADMIN:
+        return True                                  # vendor staff: all instances
+    return (
+        expected_tenant == self.tenant               # user's home tenant
+        or expected_tenant in self.allowed_tenants   # explicit cross-instance grant
+    )
+```
+
+---
+
+## Cognito Custom Attributes
+
+User-to-tenant mapping is stored in **Amazon Cognito custom attributes** set at account creation or updated by an `org_admin`:
+
+| Attribute | Type | Description |
+|---|---|---|
+| `custom:tenantId` | String | The slug of the user's home tenant. Becomes `Principal.tenant`. |
+| `custom:tenants` | String | Comma-separated list of additional tenant slugs the user may access. Parsed into `Principal.allowed_tenants`. |
+| `custom:data_scope` | String | `cebes:1000,2000` or `1000,2000` — row-level `centro_beneficio` restriction. |
+
+```python
+def _parse_allowed_tenants(value: str) -> frozenset[str]:
+    # Accepts "acme,beta-corp,demo-2024"
+    if not value:
+        return frozenset()
+    return frozenset(v.strip() for v in value.split(",") if v.strip())
+```
+
+---
+
+## Cross-Instance Access
+
+A user can be granted access to additional instances beyond their home tenant in two ways:
+
+<Steps>
+  <Step title="Admin panel assignment">
+    An `org_admin` or `platform_admin` calls `POST /api/admin/users/{username}/instances` on the primary instance. This writes to `custom:tenants` in Cognito and, if needed, updates the DynamoDB RBAC overrides table.
+  </Step>
+  <Step title="Platform admin implicit access">
+    A user with `role == platform_admin` passes `can_access_instance()` for **any** tenant slug without needing an explicit assignment. This is how vendor support staff can access all customer deployments.
+  </Step>
+</Steps>
+
+---
+
+## Tenant Provisioning
+
+New tenant instances are **never** created from within the running backend. Provisioning requires CloudFormation + IAM privileges that the application must not hold. Instead, the primary instance dispatches a **GitHub Actions workflow** via the GitHub API:
+
+```python
+async def dispatch_provision_workflow(
+    tenant_id: str,
+    admin_email: str = "",
+    rds_class: str = "db.t3.medium",
+) -> dict[str, str]:
+    url = (
+        f"https://api.github.com/repos/{settings.github_repo}"
+        f"/actions/workflows/provision-tenant.yml/dispatches"
+    )
+    await client.post(url, json={
+        "ref": "main",
+        "inputs": {
+            "tenant_id": tenant_id,
+            "admin_email": admin_email,
+            "rds_class": rds_class,
+        },
+    })
+    return {"actions_url": f"https://github.com/{settings.github_repo}/actions/..."}
+```
+
+The workflow (`provision-new-tenant.sh`) creates:
+1. A new ECS service in the existing cluster
+2. A new RDS MySQL database schema
+3. A new Cognito user group with the tenant slug
+4. An entry in the `erp-agent-tenants` DynamoDB registry
+
+<Warning>
+  Only the **primary instance** (`expected_tenant="*"`) has IAM permissions for tenant panel operations. Tenant instances have no access to the tenant registry table or ECS management APIs — they cannot operate other tenants.
+</Warning>
+
+---
+
+## DynamoDB Tenants Registry
+
+The `erp-agent-tenants` table is the authoritative registry of all provisioned tenants. It stores:
+
+| Field | Description |
+|---|---|
+| `tenant_id` | PK — slug matching the provisioning pattern |
+| `status` | `on` / `off` / `provisioning` |
+| `rds_identifier` | RDS instance ID for start/stop operations |
+| `updated_at` | ISO timestamp of last status change |
+
+The `list_tenants()` function enriches registry data with **live ECS and RDS state**:
+
+```python
+async def list_tenants() -> list[dict]:
+    # 1. Scan DynamoDB registry (authoritative for identity)
+    tenants = await asyncio.to_thread(_scan)
+
+    # 2. Enrich each tenant with live ECS running_count + RDS status
+    # Best-effort: failures return live_status="unknown", tenant still listed
+    return list(await asyncio.gather(*(_enrich(t) for t in tenants)))
+```
+
+Live status values: `on` (desired == running), `starting` (desired > running), `off` (desired == 0), `unknown` (ECS API failed).
+
+---
+
+## Tenant Start / Stop
+
+The admin panel can hibernate or wake tenant instances to control cost. `start_tenant()` and `stop_tenant()` operate both ECS and RDS in a single call:
+
+<Tabs>
+  <Tab title="Start">
+    ```python
+    async def start_tenant(tenant_id: str, desired_count: int = 1):
+        # 1. ECS: set desiredCount = 1 (or desired_count)
+        _get_ecs().update_service(
+            cluster=f"erp-agent-cluster-{tenant_id}",
+            service=f"erp-agent-service-{tenant_id}",
+            desiredCount=desired_count,
+        )
+        # 2. RDS: start_db_instance (idempotent — ignores InvalidDBInstanceState)
+        _get_rds().start_db_instance(DBInstanceIdentifier=rds_id)
+        # 3. DynamoDB: update status → "on"
+        await _update_registry_status(tenant_id, "on")
+    ```
+  </Tab>
+  <Tab title="Stop">
+    ```python
+    async def stop_tenant(tenant_id: str):
+        # 1. ECS: set desiredCount = 0
+        _get_ecs().update_service(..., desiredCount=0)
+        # 2. RDS: stop_db_instance
+        _get_rds().stop_db_instance(DBInstanceIdentifier=rds_id)
+        # 3. DynamoDB: update status → "off"
+        await _update_registry_status(tenant_id, "off")
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Admin Panel Isolation
+
+The admin panel (tenant registry, user management, RBAC assignment) is served **exclusively** by the primary instance. Requests arriving at a tenant instance for admin endpoints are rejected because:
+
+1. The tenant instance's `expected_tenant` is a specific slug, so `platform_admin` users are required.
+2. The tenant instance's IAM role does not grant `dynamodb:Scan` on `erp-agent-tenants` or `ecs:UpdateService` on other clusters.
+
+This double isolation (application-level + IAM) ensures that a compromised tenant instance cannot affect other tenants or the provisioning plane.
+
+<Note>
+  The GitHub PAT used for workflow dispatch is stored in AWS Secrets Manager. The primary instance reads it at dispatch time via `secretsmanager:GetSecretValue`. The secret name is configured in `settings.github_token_secret_name`. If the secret is absent or inaccessible, the API returns an actionable error rather than a generic 500.
+</Note>

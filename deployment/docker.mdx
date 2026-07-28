@@ -1,0 +1,211 @@
+---
+title: "Local Development with Docker Compose"
+sidebarTitle: "Docker"
+description: "Run the ERP Financial Agent locally using Docker Compose: FastAPI backend on port 8000, React/nginx frontend on port 5173, and Redis for session caching."
+---
+
+Docker Compose bundles the three services that make up the ERP Financial Agent — the FastAPI backend, the React frontend served by nginx, and Redis — into a single local environment. All you need is Docker Desktop and a populated `.env` file to have a fully functional stack running on your machine in minutes.
+
+## Prerequisites
+
+- Docker Desktop 4.x or later with the Compose plugin included
+- A `.env` file at the project root (see [Configuration](/configuration/environment-variables))
+- AWS credentials in your environment if you want the Bedrock calls to work locally
+
+## Project services
+
+The `infra/docker/docker-compose.yml` file defines three services:
+
+| Service | Image | Internal port | Host port |
+|---------|-------|--------------|-----------|
+| `redis` | `redis:7-alpine` | 6379 | 6379 |
+| `app` | Built from `infra/docker/Dockerfile` | 8000 | 8000 |
+| `frontend` | Built from `frontend/Dockerfile` | 80 | 5173 |
+
+The `app` service waits for Redis to pass its `redis-cli ping` health check before starting. The `frontend` service in turn waits for `app` to pass its own health check, so the startup order is always: Redis → Backend → Frontend.
+
+## Starting the stack
+
+<Steps>
+  <Step title="Clone the repository and create your .env file">
+    Copy `.env.example` to `.env` and fill in at minimum your database credentials and AWS region. The compose file passes the entire `.env` file to the `app` service via `env_file`, and injects `REDIS_URL=redis://redis:6379/0` automatically.
+
+    ```bash
+    cp .env.example .env
+    # Edit .env with your values
+    ```
+  </Step>
+
+  <Step title="Build the images">
+    Build both Docker images from their respective Dockerfiles. The backend build uses a two-stage process; the frontend build compiles the Vite bundle before copying it into nginx.
+
+    ```bash
+    docker compose -f infra/docker/docker-compose.yml build
+    ```
+
+    <Tip>
+      Pass `VITE_API_URL` and `VITE_WS_URL` as build arguments if you need the frontend to point to a remote backend during the build:
+
+      ```bash
+      docker compose -f infra/docker/docker-compose.yml build \
+        --build-arg VITE_API_URL=https://api.example.com \
+        --build-arg VITE_WS_URL=wss://api.example.com
+      ```
+    </Tip>
+  </Step>
+
+  <Step title="Start all services">
+    ```bash
+    docker compose -f infra/docker/docker-compose.yml up
+    ```
+
+    Once healthy, the app is reachable at:
+    - **Frontend:** `http://localhost:5173`
+    - **Backend API:** `http://localhost:8000`
+    - **API docs:** `http://localhost:8000/docs`
+  </Step>
+</Steps>
+
+## Dockerfile internals
+
+<Tabs>
+  <Tab title="Backend (infra/docker/Dockerfile)">
+    The backend Dockerfile uses a two-stage build to keep the final image lean.
+
+    **Stage 1 — builder** (`python:3.12-slim`)
+    - Copies [`uv`](https://github.com/astral-sh/uv) from `ghcr.io/astral-sh/uv:latest`
+    - Installs production dependencies into `.venv` via `uv sync --no-dev --frozen`
+    - Copies `src/` and `.claude/` into the builder layer
+
+    **Stage 2 — runtime** (`python:3.12-slim`)
+    - Installs only the minimum system libraries for chart rendering (`libfreetype6`, `libpng16-16`, `libfontconfig1`, `fonts-dejavu-core`)
+    - Creates a non-root `agent` user and group
+    - Copies `.venv`, `src/`, and `.claude/` from the builder stage
+    - Creates `/app/data/faiss_index` for the vector store
+
+    ```dockerfile
+    FROM python:3.12-slim AS builder
+    COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+    WORKDIR /app
+    COPY pyproject.toml .python-version uv.lock ./
+    RUN uv sync --no-dev --frozen
+    COPY src/ src/
+    COPY .claude/ .claude/
+
+    FROM python:3.12-slim
+    RUN apt-get update && apt-get install -y --no-install-recommends \
+        libfreetype6 libpng16-16 libfontconfig1 fonts-dejavu-core \
+        && rm -rf /var/lib/apt/lists/*
+    RUN groupadd -r agent && useradd -r -g agent agent
+    WORKDIR /app
+    COPY --from=builder /app/.venv /app/.venv
+    COPY --from=builder /app/src /app/src
+    COPY --from=builder /app/.claude /app/.claude
+    RUN mkdir -p /app/data/faiss_index && chown -R agent:agent /app
+    USER agent
+    ENV PATH="/app/.venv/bin:$PATH"
+    EXPOSE 8000
+    HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
+      CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+    CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+    ```
+
+    The container runs as the unprivileged `agent` user and exposes port `8000`. The health check polls `GET /health` every 30 seconds with a 60-second start period to allow model initialization.
+  </Tab>
+
+  <Tab title="Frontend (frontend/Dockerfile)">
+    The frontend Dockerfile also uses two stages.
+
+    **Stage 1 — build** (`node:22-alpine`)
+    - Accepts `VITE_API_URL` and `VITE_WS_URL` as build arguments, baked into the static bundle at build time
+    - Runs `npm ci` then `npm run build` to produce the `/app/dist` directory
+
+    **Stage 2 — serve** (`nginx:alpine`)
+    - Copies the compiled `dist/` into `/usr/share/nginx/html`
+    - Uses `nginx.conf` as a template (supports `BACKEND_HOST` environment variable substitution at container startup)
+    - Defaults `BACKEND_HOST=localhost`, which in the compose stack resolves to the `app` service
+
+    ```dockerfile
+    FROM node:22-alpine AS build
+    WORKDIR /app
+    ARG VITE_API_URL=""
+    ARG VITE_WS_URL=""
+    ENV VITE_API_URL=$VITE_API_URL VITE_WS_URL=$VITE_WS_URL
+    COPY package.json package-lock.json ./
+    RUN npm ci
+    COPY . .
+    RUN npm run build
+
+    FROM nginx:alpine
+    COPY --from=build /app/dist /usr/share/nginx/html
+    COPY nginx.conf /etc/nginx/templates/default.conf.template
+    ENV BACKEND_HOST=localhost
+    EXPOSE 80
+    HEALTHCHECK --interval=30s --timeout=5s CMD wget -q --spider http://localhost/ || exit 1
+    ```
+  </Tab>
+</Tabs>
+
+## Environment variable injection
+
+The `app` service loads your `.env` file via the `env_file` directive. Additionally, the compose file injects `REDIS_URL` to point at the compose network Redis service:
+
+```yaml
+env_file:
+  - ../../.env
+environment:
+  - REDIS_URL=redis://redis:6379/0
+```
+
+The `frontend` service only needs `BACKEND_HOST`, which defaults to `app` (the compose service name):
+
+```yaml
+environment:
+  - BACKEND_HOST=app
+```
+
+<Note>
+  `VITE_API_URL` and `VITE_WS_URL` are compile-time variables baked into the JavaScript bundle. If you change them, you must rebuild the image with `docker compose build frontend`.
+</Note>
+
+## Port mappings and volume mounts
+
+| Service | Host → Container | Purpose |
+|---------|-----------------|---------|
+| `redis` | `6379 → 6379` | Redis access from the host for debugging |
+| `app` | `8000 → 8000` | FastAPI HTTP and WebSocket |
+| `frontend` | `5173 → 80` | Nginx serves the React SPA |
+
+No volumes are mounted for source code — the images bundle everything at build time. Redis data is ephemeral (no named volume in the compose file); restart the container to flush the session cache during development.
+
+## Common commands
+
+<CodeGroup>
+  ```bash Start (detached)
+  docker compose -f infra/docker/docker-compose.yml up -d
+  ```
+
+  ```bash Stop and remove containers
+  docker compose -f infra/docker/docker-compose.yml down
+  ```
+
+  ```bash Rebuild images without cache
+  docker compose -f infra/docker/docker-compose.yml build --no-cache
+  ```
+
+  ```bash Tail backend logs
+  docker compose -f infra/docker/docker-compose.yml logs -f app
+  ```
+
+  ```bash Open a shell in the backend container
+  docker compose -f infra/docker/docker-compose.yml exec app bash
+  ```
+
+  ```bash Check service health status
+  docker compose -f infra/docker/docker-compose.yml ps
+  ```
+</CodeGroup>
+
+<Warning>
+  The Redis container has no persistence configured. All session data and the cost tracker cache are lost when you run `docker compose down`. For persistent local Redis, add a named volume to the `redis` service in your local override file.
+</Warning>

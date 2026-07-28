@@ -1,0 +1,333 @@
+---
+title: "Two-level LangGraph architecture of the ERP Agent"
+sidebarTitle: "Architecture"
+description: "How the outer Conversation Graph and inner SQL Pipeline Graph interact, including routing logic, the self-correction loop, HITL gate, and Schema Registry design."
+---
+
+The ERP Financial Agent is structured as two independently compiled LangGraph `StateGraph` instances that work together: an **outer Conversation Graph** that manages the full lifecycle of a conversational turn, and an **inner SQL Pipeline Graph** that owns all data-retrieval mechanics. This separation keeps orchestration concerns (clarification, planning, forecasting) cleanly isolated from query concerns (schema linking, SQL generation, validation, execution, visualization).
+
+Both graphs are built at application startup inside the FastAPI `lifespan` handler and injected into the WebSocket handler. The outer graph receives the raw user message; when a data query is required, it invokes the inner graph as a sub-call from its `execute` node.
+
+## Full data-flow diagram
+
+```
+User message (WebSocket /ws/chat or POST /chat)
+        │
+        ▼
+┌──────────────────────────────────────────────────────────────┐
+│               OUTER GRAPH — ConversationState                │
+│                                                              │
+│  understand ──┬──► clarify ──┬──► plan ──► execute ──► present
+│               │              └──────────────────────► present
+│               ├──► viz_change ──────────────────────► present
+│               ├──► forecast ───────────────────────► present
+│               ├──► analyze_file ───────────────────► present
+│               ├──► discuss_data ────────────────────► present
+│               ├──► general_respond ─────────────────► present
+│               └──► plan ──────────────────────────► execute
+│                                    │                         │
+│                              ┌─────┘                         │
+│                              ▼                               │
+│               ┌──────────────────────────────────────────┐  │
+│               │       INNER GRAPH — AgentState            │  │
+│               │                                           │  │
+│               │  router ──┬──► schema_linker              │  │
+│               │           │         │                     │  │
+│               │           │    sql_generator              │  │
+│               │           │         │                     │  │
+│               │           │    sql_validator ◄──────────┐ │  │
+│               │           │         │                   │ │  │
+│               │           │    ┌────┴──────┬──────┐     │ │  │
+│               │           │  execute     fix   give_up  │ │  │
+│               │           │    │           │            │ │  │
+│               │           │  hitl_checker  error_handler┘ │  │
+│               │           │    │                          │  │
+│               │           │  sql_executor                 │  │
+│               │           │    │                          │  │
+│               │           │  data_analyst                 │  │
+│               │           │    │                          │  │
+│               │           │  visualizer ──┬──► report_writer│ │
+│               │           │               └──► response_formatter
+│               │           │                                  │
+│               │           ├──► follow_up_restore ──► data_analyst
+│               │           └──► general_response ──► END     │
+│               └──────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
+        │
+        ▼
+  Streamed response (chart_config, kpis, sql, row_count, exports)
+```
+
+---
+
+## Outer Graph — Conversation orchestrator
+
+Defined in `src/agent/conversation_graph.py` and compiled with `build_conversation_graph(inner_graph)`. It uses a flexible `dict` state (typed as `ConversationState`) and contains **10 nodes**.
+
+### Nodes
+
+| Node | Role |
+|------|------|
+| `understand` | Classifies intent and turn type; extracts missing slots |
+| `clarify` | Prompts the user for missing information or applies smart defaults |
+| `plan` | Prepares the `inner_state` dict to pass to the SQL pipeline |
+| `execute` | Invokes `inner_graph.ainvoke(inner_state)`; propagates RBAC fields |
+| `present` | Formats the final response, adds follow-up suggestions |
+| `viz_change` | Re-renders an existing result set with a different chart type |
+| `forecast` | Runs time-series projection via StatsForecast |
+| `analyze_file` | Analyzes an uploaded Excel or CSV file |
+| `general_respond` | Answers non-data questions using conversation history |
+| `discuss_data` | Interprets or comments on data already visible in the session |
+
+### Routing after `understand`
+
+The `_route_after_understand` function reads `turn_type` from state and dispatches accordingly:
+
+```python src/agent/conversation_graph.py
+def _route_after_understand(state: dict) -> str:
+    turn_type = state.get("turn_type", "new_query")
+    missing_slots = state.get("missing_slots", [])
+
+    if missing_slots:
+        return "clarify"
+    if turn_type == "viz_change":
+        return "viz_change"
+    if turn_type == "forecast":
+        return "forecast"
+    if turn_type == "file_analysis":
+        if state.get("file_data") or state.get("file_metadata"):
+            return "analyze_file"
+        return "general_respond"
+    if turn_type == "discuss":
+        return "discuss_data"
+    if turn_type == "general":
+        return "general_respond"
+    return "plan"
+```
+
+### Intent / turn-type taxonomy
+
+| `turn_type` value | Meaning | Outer path |
+|-------------------|---------|-----------|
+| `new_query` | Fresh data question | `plan → execute → present` |
+| `viz_change` | "Show as pie chart instead" | `viz_change → present` |
+| `forecast` | Time-series projection request | `forecast → present` |
+| `file_analysis` | Question about an uploaded file | `analyze_file → present` |
+| `discuss` | Interpret data already on screen | `discuss_data → present` |
+| `general` | Off-topic or greeting | `general_respond → present` |
+
+---
+
+## Inner Graph — SQL pipeline
+
+Defined in `src/agent/graph.py` and compiled with `build_graph()`. It uses a typed `AgentState` and contains **13 nodes**.
+
+### Nodes
+
+| Node | Role |
+|------|------|
+| `router` | Classifies intent into `query`, `analysis`, `chart`, `follow_up_chart`, `follow_up_analysis`, or `general` |
+| `schema_linker` | FAISS semantic search over table metadata to select relevant tables |
+| `sql_generator` | Generates SQL using Claude Sonnet 4.5 with ERP-specific prompts |
+| `sql_validator` | Validates syntax (sqlglot), safety (read-only guard), and RBAC table access |
+| `error_handler` | Produces a correction prompt for the LLM based on validation errors |
+| `hitl_checker` | Decides if the query requires human confirmation before execution |
+| `sql_executor` | Executes the validated SQL against MySQL via aiomysql |
+| `data_analyst` | Computes KPI cards (totals, averages, min/max) from result rows |
+| `visualizer` | Selects chart type and builds ECharts-compatible `chart_config` |
+| `report_writer` | Produces an executive summary for analysis-intent queries |
+| `response_formatter` | Assembles the final `ChatResponse` payload |
+| `general_response` | Handles off-topic questions at the inner graph level |
+| `follow_up_restore` | Copies `previous_query_results` into current state for follow-up turns |
+
+### Intent routing at the inner graph
+
+```python src/agent/graph.py
+def _route_by_intent(state: AgentState) -> str:
+    intent = state.get("intent", "query")
+    if intent in ("query", "analysis", "chart"):
+        return "schema_linker"
+    if intent in ("follow_up_chart", "follow_up_analysis"):
+        return "follow_up_restore"
+    return "general_response"
+```
+
+---
+
+## Self-correction loop
+
+When `sql_validator` finds errors it routes to `error_handler`, which rewrites the generation prompt with the specific error context and feeds it back into `sql_validator`. The loop runs a maximum of **3 attempts** (`MAX_CORRECTION_ATTEMPTS`). After that, or if a security violation is detected, the graph routes to `give_up → response_formatter`.
+
+```python src/agent/graph.py
+def _route_after_validation(state: AgentState) -> str:
+    if state.get("validation_passed", False):
+        return "execute"
+
+    errors = state.get("validation_errors", [])
+    attempt = state.get("correction_attempt", 0)
+
+    has_security_error = any(e.get("error_type") == "security" for e in errors)
+    if has_security_error:
+        return "give_up"
+
+    if attempt >= settings.max_correction_attempts:
+        return "give_up"
+
+    return "fix"
+```
+
+```
+sql_generator → sql_validator ──(pass)──► hitl_checker
+                     ▲               │
+                     │           (fail, attempt < 3)
+                     │               │
+                error_handler ◄──────┘
+                (attempt >= 3 or security) → give_up → response_formatter
+```
+
+---
+
+## Human-in-the-loop (HITL) gate
+
+Before executing any SQL query, `hitl_checker` evaluates whether the query requires explicit user confirmation. If so, it returns `confirmation_required: true` immediately without running the query. The client must re-send the message with `confirmed: true` to proceed.
+
+```python src/agent/graph.py
+def _route_after_hitl(state: AgentState) -> str:
+    if state.get("confirmation_required", False):
+        return "wait_confirmation"
+    return "sql_executor"
+```
+
+The `wait_confirmation` edge routes to `response_formatter`, which packages a `confirmation_message` for the frontend to display as a confirmation dialog. The REST handler in `main.py` mirrors this:
+
+```python src/api/main.py
+if result.get("confirmation_required"):
+    return ChatResponse(
+        response=result.get("confirmation_message", ""),
+        intent=result.get("intent"),
+        session_id=session_id,
+        confirmation_required=True,
+        confirmation_message=result.get("confirmation_message"),
+    )
+```
+
+---
+
+## Schema Registry
+
+The Schema Registry is built at startup (`build_schema_registry()`) and provides semantic table selection to the `schema_linker` node.
+
+<Accordion title="How Schema Registry works">
+
+1. **INFORMATION_SCHEMA scan** — `schema_metadata.py` reads all tables and columns from MySQL's `INFORMATION_SCHEMA` and caches the raw metadata in Redis to avoid repeated DB round-trips.
+2. **Enrichment** — `enricher.py` adds a business-domain glossary, explicit join paths between SAP tables, and natural-language descriptions of each column.
+3. **FAISS indexing** — `store.py` encodes every table description using **Amazon Titan Text Embeddings V2** (1 024 dimensions) and stores them in a FAISS CPU flat index.
+4. **Semantic search** — At query time, `schema_linker` encodes the user question with Titan V2, performs a nearest-neighbour search in FAISS, and returns the top-k most relevant tables to the SQL generator.
+5. **Metrics layer** — `metrics_registry.py` stores pre-defined KPI definitions as a semantic layer so common financial metrics (e.g. EBITDA, budget vs. actual) resolve correctly without table guessing.
+
+</Accordion>
+
+<Note>
+  The Schema Registry build is gated by a **120-second startup timeout** in `src/api/main.py`. On a cold start with a large SAP schema, this may be approached. Subsequent starts use the Redis-cached metadata and are significantly faster.
+</Note>
+
+---
+
+## Infrastructure stack
+
+| Component | Technology |
+|-----------|-----------|
+| **LLM** | AWS Bedrock — Claude Sonnet 4.5 (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`) |
+| **Embeddings** | Amazon Titan Text Embeddings V2 — 1 024 dimensions (`amazon.titan-embed-text-v2:0`) |
+| **Orchestration** | LangGraph async (`langgraph >= 1.0.5`) |
+| **Backend** | FastAPI 0.128 + Uvicorn + WebSocket + slowapi rate limiting |
+| **Frontend** | React 19 + Vite 7 + TypeScript 5.9 + Tailwind CSS 4 + ECharts 6 |
+| **Database** | MySQL (SAP ERP migrated) — aiomysql + SQLAlchemy 2.0 |
+| **Auth** | AWS Cognito JWT — validated server-side via `python-jose[cryptography]` |
+| **Cache / Sessions** | Redis 7 (ElastiCache) — async pool via `redis[hiredis]` |
+| **Long-term memory** | DynamoDB — 90-day TTL on conversation history + RBAC overrides |
+| **Schema index** | FAISS CPU (`faiss-cpu >= 1.8.0`) |
+| **Infrastructure** | AWS ECS Fargate + ALB + NAT Gateway |
+| **Observability** | Prometheus (`prometheus-client`) + structlog + LangSmith tracing |
+| **Forecasting** | StatsForecast (`statsforecast >= 1.7.0`) |
+| **SQL parsing** | sqlglot (`sqlglot >= 26.0.0`) |
+
+---
+
+## State schemas
+
+<Tabs>
+  <Tab title="ConversationState (outer)">
+    The outer graph uses a flexible `dict` state. Key fields propagated between nodes:
+
+    | Field | Type | Description |
+    |-------|------|-------------|
+    | `raw_message` | `str` | Original user message |
+    | `turn_type` | `str` | Classified turn type (see taxonomy above) |
+    | `missing_slots` | `list` | Required information not yet provided |
+    | `resolved_question` | `str` | Clarified/normalized question |
+    | `inner_state` | `dict` | State dict passed to the inner graph |
+    | `execution_result` | `dict` | Full result returned by the inner graph |
+    | `generated_sql` | `str` | SQL produced by the pipeline |
+    | `previous_query_results` | `list` | Rows from the last executed query |
+    | `previous_column_names` | `list` | Column names from the last query |
+    | `conversation_history` | `list` | Recent turns for context injection |
+    | `user_id` / `user_role` | `str` | RBAC identity fields |
+    | `allowed_tables` / `user_modules` | `list` | RBAC permission sets |
+  </Tab>
+  <Tab title="AgentState (inner)">
+    The inner graph uses a typed `AgentState` Pydantic model. Key fields:
+
+    | Field | Type | Description |
+    |-------|------|-------------|
+    | `question` | `str` | The data question to answer |
+    | `session_id` | `str` | Session identifier for context retrieval |
+    | `intent` | `str` | Classified intent (`query`, `analysis`, `chart`, …) |
+    | `selected_tables` | `list` | Tables chosen by `schema_linker` |
+    | `generated_sql` | `str` | SQL string produced by `sql_generator` |
+    | `validation_passed` | `bool` | Result of `sql_validator` |
+    | `validation_errors` | `list` | Structured error list with `error_type` |
+    | `correction_attempt` | `int` | Self-correction iteration counter (max 3) |
+    | `confirmation_required` | `bool` | HITL gate flag |
+    | `query_results` | `list` | Raw rows from `sql_executor` |
+    | `column_names` | `list` | Column names from result set |
+    | `row_count` | `int` | Number of result rows |
+    | `kpis` | `dict` | KPI card data from `data_analyst` |
+    | `chart_config` | `dict` | ECharts configuration from `visualizer` |
+    | `executive_summary` | `str` | Narrative from `report_writer` |
+    | `analysis_intent` | `str` | `"query"` or `"analysis"` — drives post-visualizer routing |
+    | `exports` | `dict` | CSV/Excel download URLs |
+    | `previous_query_results` | `list` | Carried forward for follow-up turns |
+  </Tab>
+</Tabs>
+
+---
+
+## Request lifecycle (end-to-end)
+
+<Steps>
+  <Step title="WebSocket message received">
+    The frontend sends a JSON message over `/ws/chat`. The WebSocket handler authenticates the Cognito JWT, retrieves or creates a Redis session, and calls `conversation_graph.ainvoke(state)`.
+  </Step>
+  <Step title="Outer graph: understand">
+    Claude Sonnet 4.5 classifies the message into a `turn_type` and checks for missing required slots (e.g. date range, cost centre).
+  </Step>
+  <Step title="Outer graph: plan → execute">
+    The planner builds `inner_state` including the resolved question, conversation history digest, and RBAC fields. The `execute` node calls `inner_graph.ainvoke(inner_state)`.
+  </Step>
+  <Step title="Inner graph: schema_linker">
+    The question is embedded with Amazon Titan V2; FAISS returns the most semantically relevant SAP tables. The enriched table schemas are injected into the SQL generation prompt.
+  </Step>
+  <Step title="Inner graph: sql_generator → sql_validator (→ error_handler loop)">
+    Claude generates a SQL query. `sql_validator` checks syntax via sqlglot, enforces read-only access, and validates RBAC table restrictions. If invalid, `error_handler` corrects and retries (up to 3 times).
+  </Step>
+  <Step title="Inner graph: hitl_checker → sql_executor">
+    If HITL is triggered, the pipeline halts and returns a `confirmation_required` response. Otherwise, `sql_executor` runs the query against MySQL and returns rows and column names.
+  </Step>
+  <Step title="Inner graph: data_analyst → visualizer → report_writer → response_formatter">
+    KPI cards are computed, a chart type is selected and configured, an executive summary is optionally written (for analysis intent), and the full `AgentState` is packaged into a `ChatResponse`.
+  </Step>
+  <Step title="Outer graph: present">
+    The `present` node adds contextual follow-up suggestions and streams the final payload back to the WebSocket client.
+  </Step>
+</Steps>

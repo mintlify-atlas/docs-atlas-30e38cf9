@@ -1,0 +1,657 @@
+---
+title: "Admin API — User, Group & Module Management"
+sidebarTitle: "Admin"
+description: "Manage Cognito users, assign roles and groups, configure per-user data module access, and retrieve LLM cost summaries. Primary instance only."
+---
+
+The Admin API provides full lifecycle management for users in the shared Cognito user pool: creating and deleting accounts, assigning Cognito groups, controlling per-user data module access, and assigning tenant instance access. All endpoints are gated behind two independent checks.
+
+<Warning>
+  **Primary instance only.** Every endpoint in this section returns `404 Not Found` when called against a tenant instance (where `expected_tenant != "*"`). This is intentional — the admin plane is deliberately invisible on tenant deployments to prevent a tenant admin from managing shared-pool users. See dev-log/037.
+</Warning>
+
+<Warning>
+  **Admin group required.** The caller's JWT must include the `admin` Cognito group. Any other authenticated user receives `403 Forbidden`.
+</Warning>
+
+---
+
+## Authentication
+
+```http
+Authorization: Bearer <id_token>
+```
+
+The token must be issued by the shared Cognito user pool. Tenant-specific pool tokens are rejected.
+
+---
+
+## User Management
+
+### GET /api/admin/users
+
+List all users in the Cognito user pool. Supports pagination and server-side filtering.
+
+#### Query Parameters
+
+<ParamField query="limit" type="integer" default="60">
+  Maximum number of users to return per page (Cognito maximum is 60).
+</ParamField>
+
+<ParamField query="pagination_token" type="string">
+  Opaque token returned in a previous response to fetch the next page.
+</ParamField>
+
+<ParamField query="filter" type="string">
+  Cognito filter expression, e.g. `email = "user@example.com"`.
+</ParamField>
+
+#### Response — `AdminUserListResponse`
+
+<ResponseField name="users" type="array" required>
+  Array of user summary objects.
+
+  <Expandable title="AdminUserSummary fields">
+    <ResponseField name="username" type="string" required>Cognito username (typically the email).</ResponseField>
+    <ResponseField name="email" type="string" required>User's email address.</ResponseField>
+    <ResponseField name="sub" type="string">Cognito subject UUID — the stable unique identifier.</ResponseField>
+    <ResponseField name="name" type="string">Display name.</ResponseField>
+    <ResponseField name="empresa" type="string">Company / organisation name.</ResponseField>
+    <ResponseField name="tenant" type="string">Tenant identifier assigned to this user.</ResponseField>
+    <ResponseField name="data_scope" type="string">Comma-separated centro de beneficio codes restricting row-level access. Empty string means no restriction.</ResponseField>
+    <ResponseField name="instances" type="array">List of additional instance slugs the user can access (`custom:tenants`).</ResponseField>
+    <ResponseField name="status" type="string">Account status: `CONFIRMED`, `FORCE_CHANGE_PASSWORD`, `UNCONFIRMED`, etc.</ResponseField>
+    <ResponseField name="enabled" type="boolean">Whether the account is currently enabled.</ResponseField>
+    <ResponseField name="created" type="string">ISO-8601 creation timestamp.</ResponseField>
+    <ResponseField name="modified" type="string">ISO-8601 last-modified timestamp.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="pagination_token" type="string">
+  Present when more users exist beyond this page. Pass as the `pagination_token` query parameter in the next request.
+</ResponseField>
+
+<ResponseField name="count" type="integer" required>
+  Number of users in this response page.
+</ResponseField>
+
+<CodeGroup>
+```bash cURL
+curl -X GET "https://api.example.com/api/admin/users?limit=20" \
+  -H "Authorization: Bearer <id_token>"
+```
+
+```json Response
+{
+  "users": [
+    {
+      "username": "ana.garcia@empresa.com",
+      "email": "ana.garcia@empresa.com",
+      "sub": "a1b2c3d4-...",
+      "name": "Ana García",
+      "empresa": "Empresa S.A.",
+      "tenant": "empresa-sa",
+      "data_scope": "",
+      "instances": [],
+      "status": "CONFIRMED",
+      "enabled": true,
+      "created": "2024-01-15T10:30:00Z",
+      "modified": "2024-06-01T08:00:00Z"
+    }
+  ],
+  "pagination_token": null,
+  "count": 1
+}
+```
+</CodeGroup>
+
+---
+
+### POST /api/admin/users
+
+Create a new Cognito user. Returns the full `AdminUserDetail` on success with HTTP `201 Created`.
+
+<Note>
+  Rate limited to **10 requests per minute**. The temporary password must be shared with the user through a secure out-of-band channel.
+</Note>
+
+#### Request Body — `CreateUserRequest`
+
+<ParamField body="email" type="string" required>
+  The user's email address. Must be a valid email format. Also used as the Cognito username. Returns `409 Conflict` if the email is already registered.
+</ParamField>
+
+<ParamField body="temporary_password" type="string" required>
+  Initial password (8–128 characters). The user will be forced to change it on first login. Returns `400` if it doesn't meet Cognito's password policy.
+</ParamField>
+
+<ParamField body="name" type="string">
+  Display name for the user.
+</ParamField>
+
+<ParamField body="empresa" type="string">
+  Company or organisation name stored as `custom:company`.
+</ParamField>
+
+<ParamField body="tenant" type="string">
+  Tenant identifier stored as `custom:tenantId`.
+</ParamField>
+
+#### Response — `AdminUserDetail`
+
+Extends `AdminUserSummary` with usage statistics:
+
+<ResponseField name="groups" type="array">
+  List of Cognito group names the user belongs to.
+</ResponseField>
+<ResponseField name="session_count" type="integer">Total conversation sessions in DynamoDB.</ResponseField>
+<ResponseField name="total_messages" type="integer">Total messages sent across all sessions.</ResponseField>
+<ResponseField name="total_queries" type="integer">Total SQL queries executed.</ResponseField>
+<ResponseField name="last_active" type="string">ISO-8601 timestamp of the most recent session activity.</ResponseField>
+
+<CodeGroup>
+```bash cURL
+curl -X POST https://api.example.com/api/admin/users \
+  -H "Authorization: Bearer <id_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "carlos.lopez@empresa.com",
+    "temporary_password": "TempPass123!",
+    "name": "Carlos López",
+    "empresa": "Empresa S.A.",
+    "tenant": "empresa-sa"
+  }'
+```
+
+```json Response 201
+{
+  "username": "carlos.lopez@empresa.com",
+  "email": "carlos.lopez@empresa.com",
+  "sub": "e5f6g7h8-...",
+  "name": "Carlos López",
+  "empresa": "Empresa S.A.",
+  "tenant": "empresa-sa",
+  "data_scope": "",
+  "instances": [],
+  "status": "FORCE_CHANGE_PASSWORD",
+  "enabled": true,
+  "created": "2024-11-10T14:20:00Z",
+  "modified": "2024-11-10T14:20:00Z",
+  "groups": [],
+  "session_count": 0,
+  "total_messages": 0,
+  "total_queries": 0,
+  "last_active": null
+}
+```
+</CodeGroup>
+
+---
+
+### GET /api/admin/users/\{username\}
+
+Retrieve full details for a single user, including Cognito groups and aggregated DynamoDB usage statistics.
+
+#### Path Parameters
+
+<ParamField path="username" type="string" required>
+  The Cognito username (typically the user's email address).
+</ParamField>
+
+#### Response
+
+Returns `AdminUserDetail` (same shape as `POST /api/admin/users` response above).
+
+<CodeGroup>
+```bash cURL
+curl -X GET https://api.example.com/api/admin/users/ana.garcia@empresa.com \
+  -H "Authorization: Bearer <id_token>"
+```
+
+```json Response
+{
+  "username": "ana.garcia@empresa.com",
+  "email": "ana.garcia@empresa.com",
+  "sub": "a1b2c3d4-...",
+  "name": "Ana García",
+  "empresa": "Empresa S.A.",
+  "tenant": "empresa-sa",
+  "data_scope": "",
+  "instances": ["empresa-sa", "holding-mx"],
+  "status": "CONFIRMED",
+  "enabled": true,
+  "created": "2024-01-15T10:30:00Z",
+  "modified": "2024-09-20T12:00:00Z",
+  "groups": ["finance_lead"],
+  "session_count": 47,
+  "total_messages": 312,
+  "total_queries": 289,
+  "last_active": "2024-11-09T17:45:00Z"
+}
+```
+</CodeGroup>
+
+---
+
+### PUT /api/admin/users/\{username\}
+
+Update one or more Cognito attributes for an existing user. Omitted fields are left unchanged.
+
+#### Path Parameters
+
+<ParamField path="username" type="string" required>
+  The Cognito username to update.
+</ParamField>
+
+#### Request Body — `UpdateUserRequest`
+
+<ParamField body="name" type="string">
+  New display name (`name` attribute).
+</ParamField>
+
+<ParamField body="empresa" type="string">
+  Updated company name (`custom:company`).
+</ParamField>
+
+<ParamField body="tenant" type="string">
+  Updated tenant identifier (`custom:tenantId`). The user must re-authenticate for the change to take effect.
+</ParamField>
+
+<ParamField body="data_scope" type="string">
+  Row-level filter: comma-separated centro de beneficio codes, e.g. `"1000,2000"`. Pass an empty string `""` to remove all restrictions.
+</ParamField>
+
+#### Response — `AdminActionResponse`
+
+<ResponseField name="success" type="boolean" required>
+  `true` on success.
+</ResponseField>
+<ResponseField name="message" type="string" required>
+  Human-readable confirmation message.
+</ResponseField>
+
+<CodeGroup>
+```bash cURL
+curl -X PUT https://api.example.com/api/admin/users/ana.garcia@empresa.com \
+  -H "Authorization: Bearer <id_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Ana García Ruiz", "data_scope": "1000,2000"}'
+```
+
+```json Response
+{
+  "success": true,
+  "message": "User 'ana.garcia@empresa.com' updated successfully"
+}
+```
+</CodeGroup>
+
+---
+
+### DELETE /api/admin/users/\{username\}
+
+Permanently delete a Cognito user. **This action cannot be undone.** All Cognito records are removed; DynamoDB conversation history is not deleted by this endpoint.
+
+<Warning>
+  Rate limited to **5 requests per minute**. All admin delete actions are written to the audit log.
+</Warning>
+
+#### Path Parameters
+
+<ParamField path="username" type="string" required>
+  The Cognito username to delete.
+</ParamField>
+
+<CodeGroup>
+```bash cURL
+curl -X DELETE https://api.example.com/api/admin/users/carlos.lopez@empresa.com \
+  -H "Authorization: Bearer <id_token>"
+```
+
+```json Response
+{
+  "success": true,
+  "message": "User 'carlos.lopez@empresa.com' permanently deleted"
+}
+```
+</CodeGroup>
+
+---
+
+### POST /api/admin/users/\{username\}/reset-password
+
+Trigger a Cognito-initiated password reset. Cognito sends a reset code to the user's email. Rate limited to **5 requests per minute**.
+
+<CodeGroup>
+```bash cURL
+curl -X POST https://api.example.com/api/admin/users/ana.garcia@empresa.com/reset-password \
+  -H "Authorization: Bearer <id_token>"
+```
+
+```json Response
+{
+  "success": true,
+  "message": "Password reset initiated for 'ana.garcia@empresa.com'"
+}
+```
+</CodeGroup>
+
+---
+
+### POST /api/admin/users/\{username\}/disable
+
+Disable a user account without deleting it. The user cannot log in while disabled but all records are preserved. Rate limited to **10 requests per minute**.
+
+<CodeGroup>
+```bash cURL
+curl -X POST https://api.example.com/api/admin/users/ana.garcia@empresa.com/disable \
+  -H "Authorization: Bearer <id_token>"
+```
+
+```json Response
+{
+  "success": true,
+  "message": "User 'ana.garcia@empresa.com' disabled"
+}
+```
+</CodeGroup>
+
+---
+
+### POST /api/admin/users/\{username\}/enable
+
+Re-enable a previously disabled user account. Rate limited to **10 requests per minute**.
+
+<CodeGroup>
+```bash cURL
+curl -X POST https://api.example.com/api/admin/users/ana.garcia@empresa.com/enable \
+  -H "Authorization: Bearer <id_token>"
+```
+
+```json Response
+{
+  "success": true,
+  "message": "User 'ana.garcia@empresa.com' enabled"
+}
+```
+</CodeGroup>
+
+---
+
+## Group & Role Management
+
+### GET /api/admin/groups
+
+List all Cognito groups in the shared user pool. Groups map to RBAC roles.
+
+#### Response — `GroupListResponse`
+
+<ResponseField name="groups" type="array" required>
+  <Expandable title="GroupInfo fields">
+    <ResponseField name="group_name" type="string" required>Cognito group name (e.g. `finance_lead`, `analyst`).</ResponseField>
+    <ResponseField name="description" type="string">Human-readable description of the group's purpose.</ResponseField>
+    <ResponseField name="created" type="string">ISO-8601 creation timestamp.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<CodeGroup>
+```bash cURL
+curl -X GET https://api.example.com/api/admin/groups \
+  -H "Authorization: Bearer <id_token>"
+```
+
+```json Response
+{
+  "groups": [
+    { "group_name": "admin",        "description": "Platform & org admins", "created": "2023-08-01T00:00:00Z" },
+    { "group_name": "finance_lead", "description": "Finance lead analysts",  "created": "2023-08-01T00:00:00Z" },
+    { "group_name": "analyst",      "description": "Standard analysts",      "created": "2023-08-01T00:00:00Z" },
+    { "group_name": "viewer",       "description": "Read-only viewers",      "created": "2023-08-01T00:00:00Z" }
+  ]
+}
+```
+</CodeGroup>
+
+---
+
+### POST /api/admin/users/\{username\}/groups
+
+Add a user to a Cognito group. The new role permissions take effect on the user's next token issuance.
+
+#### Path Parameters
+
+<ParamField path="username" type="string" required>Cognito username.</ParamField>
+
+#### Request Body — `UserGroupRequest`
+
+<ParamField body="group_name" type="string" required>
+  Name of the Cognito group to add the user to.
+</ParamField>
+
+<CodeGroup>
+```bash cURL
+curl -X POST https://api.example.com/api/admin/users/ana.garcia@empresa.com/groups \
+  -H "Authorization: Bearer <id_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"group_name": "finance_lead"}'
+```
+
+```json Response
+{
+  "success": true,
+  "message": "User 'ana.garcia@empresa.com' added to group 'finance_lead'"
+}
+```
+</CodeGroup>
+
+---
+
+### DELETE /api/admin/users/\{username\}/groups/\{group_name\}
+
+Remove a user from a Cognito group.
+
+#### Path Parameters
+
+<ParamField path="username" type="string" required>Cognito username.</ParamField>
+<ParamField path="group_name" type="string" required>Name of the Cognito group to remove the user from.</ParamField>
+
+<CodeGroup>
+```bash cURL
+curl -X DELETE \
+  https://api.example.com/api/admin/users/ana.garcia@empresa.com/groups/finance_lead \
+  -H "Authorization: Bearer <id_token>"
+```
+
+```json Response
+{
+  "success": true,
+  "message": "User 'ana.garcia@empresa.com' removed from group 'finance_lead'"
+}
+```
+</CodeGroup>
+
+---
+
+## Module Assignment
+
+Module overrides let administrators grant or revoke individual data modules beyond what a user's base role provides. Overrides are persisted to DynamoDB and applied on every request without requiring a token refresh.
+
+<Note>
+  Both module endpoints require the `admin.rbac.assign` permission in addition to the `admin` Cognito group membership. Callers without this permission receive `403 Forbidden`.
+</Note>
+
+### GET /api/admin/users/\{user_id\}/modules
+
+Return the effective module set for a user: their role's base modules, plus any DynamoDB overrides (additions and removals).
+
+#### Path Parameters
+
+<ParamField path="user_id" type="string" required>
+  The Cognito `sub` (UUID) or username of the target user.
+</ParamField>
+
+#### Response — `UserModulesResponse`
+
+<ResponseField name="user_id" type="string" required>Cognito subject UUID of the target user.</ResponseField>
+<ResponseField name="tenant" type="string" required>Tenant the user belongs to.</ResponseField>
+<ResponseField name="role" type="string" required>Effective role name (e.g. `analyst`).</ResponseField>
+<ResponseField name="base_modules" type="array" required>Modules granted by the user's role before overrides.</ResponseField>
+<ResponseField name="modules_added" type="array" required>Modules explicitly granted via DynamoDB override.</ResponseField>
+<ResponseField name="modules_removed" type="array" required>Modules explicitly revoked via DynamoDB override.</ResponseField>
+<ResponseField name="effective_modules" type="array" required>Final computed module set: `(base ∪ added) − removed`.</ResponseField>
+
+<CodeGroup>
+```bash cURL
+curl -X GET \
+  "https://api.example.com/api/admin/users/a1b2c3d4-e5f6-7890-abcd-ef1234567890/modules" \
+  -H "Authorization: Bearer <id_token>"
+```
+
+```json Response
+{
+  "user_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "tenant": "empresa-sa",
+  "role": "analyst",
+  "base_modules": ["costos", "ingresos", "presupuestos"],
+  "modules_added": ["pagos"],
+  "modules_removed": ["presupuestos"],
+  "effective_modules": ["costos", "ingresos", "pagos"]
+}
+```
+</CodeGroup>
+
+---
+
+### PUT /api/admin/users/\{user_id\}/modules
+
+Set per-user module overrides. Completely replaces any previous override for the user. Pass empty arrays to clear all overrides.
+
+<Note>
+  Valid module slugs: `ingresos`, `costos`, `nomina`, `presupuestos`, `pagos`, `produccion`, `compras`, `inventario`, `logistica`. An unknown slug returns `400 Bad Request` with a list of valid values.
+</Note>
+
+#### Path Parameters
+
+<ParamField path="user_id" type="string" required>
+  Cognito `sub` UUID or username of the target user.
+</ParamField>
+
+#### Request Body — `SetUserModulesRequest`
+
+<ParamField body="modules_added" type="array">
+  Module slugs to grant beyond the role's default set. Defaults to `[]`.
+</ParamField>
+
+<ParamField body="modules_removed" type="array">
+  Module slugs to revoke from the role's default set. Defaults to `[]`.
+</ParamField>
+
+<CodeGroup>
+```bash cURL
+curl -X PUT \
+  "https://api.example.com/api/admin/users/a1b2c3d4-e5f6-7890-abcd-ef1234567890/modules" \
+  -H "Authorization: Bearer <id_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "modules_added": ["pagos"],
+    "modules_removed": ["presupuestos"]
+  }'
+```
+
+```json Response
+{
+  "success": true,
+  "message": "Module overrides updated for user 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'"
+}
+```
+</CodeGroup>
+
+---
+
+## Instance Access
+
+### PUT /api/admin/users/\{username\}/instances
+
+Assign the set of tenant instances a user is allowed to access, writing to the `custom:tenants` Cognito attribute. The user must sign out and back in for the change to take effect — access is read from the JWT.
+
+<Warning>
+  Instance slugs are validated against the registered tenant registry. Unrecognised slugs return `400 Bad Request`. Requires `admin.rbac.assign` permission.
+</Warning>
+
+#### Path Parameters
+
+<ParamField path="username" type="string" required>Cognito username of the target user.</ParamField>
+
+#### Request Body — `SetUserInstancesRequest`
+
+<ParamField body="instances" type="array" required>
+  List of registered instance slugs to assign. Pass an empty array to revoke all cross-instance access.
+</ParamField>
+
+<CodeGroup>
+```bash cURL
+curl -X PUT \
+  https://api.example.com/api/admin/users/ana.garcia@empresa.com/instances \
+  -H "Authorization: Bearer <id_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"instances": ["empresa-sa", "holding-mx"]}'
+```
+
+```json Response
+{
+  "success": true,
+  "message": "Instancias asignadas a 'ana.garcia@empresa.com': ['empresa-sa', 'holding-mx']. El usuario debe volver a iniciar sesión."
+}
+```
+</CodeGroup>
+
+---
+
+## Cost Tracking
+
+### GET /api/admin/costs
+
+Return a summary of LLM token costs aggregated globally, by user, and by agent node. Useful for monitoring spend and identifying heavy users.
+
+<Note>
+  Cost data is aggregated from the backend cost tracking store. The exact shape of `global`, `by_user`, and `by_node` sub-objects depends on the cost tracking configuration.
+</Note>
+
+<CodeGroup>
+```bash cURL
+curl -X GET https://api.example.com/api/admin/costs \
+  -H "Authorization: Bearer <id_token>"
+```
+
+```json Response
+{
+  "global": {
+    "total_tokens": 18500000,
+    "total_cost_usd": 74.20,
+    "period": "2024-11"
+  },
+  "by_user": {
+    "a1b2c3d4-...": { "tokens": 320000, "cost_usd": 1.28 },
+    "e5f6g7h8-...": { "tokens": 510000, "cost_usd": 2.04 }
+  },
+  "by_node": {
+    "sql_generator": { "tokens": 9200000, "cost_usd": 36.80 },
+    "schema_linker":  { "tokens": 4100000, "cost_usd": 16.40 },
+    "answer_writer":  { "tokens": 5200000, "cost_usd": 21.00 }
+  }
+}
+```
+</CodeGroup>
+
+---
+
+## Error Reference
+
+| Status | Condition |
+|--------|-----------|
+| `400 Bad Request` | Invalid request body, unknown module/group name, or no update attributes provided. |
+| `403 Forbidden` | Caller is authenticated but not in the `admin` Cognito group, or lacks `admin.rbac.assign`. |
+| `404 Not Found` | Called on a non-primary tenant instance, or the target user/group was not found. |
+| `409 Conflict` | A user with the given email already exists in Cognito. |
+| `429 Too Many Requests` | Per-endpoint rate limit exceeded. |
+| `502 Bad Gateway` | Unexpected error from Cognito or DynamoDB. |

@@ -1,0 +1,228 @@
+---
+title: "Memory Architecture: Redis Sessions and DynamoDB History"
+sidebarTitle: "Memory"
+description: "How the ERP agent combines Redis short-term session memory with DynamoDB long-term conversation history to give Claude cross-turn and cross-session context."
+---
+
+The ERP Financial Agent uses a two-tier memory architecture. **Redis** holds the hot, ephemeral state of each active conversation — messages, uploaded file data, and checkpoint blobs for the clarification loop. **DynamoDB** stores compressed session summaries that persist for 90 days and are injected back into Claude's context window at the start of every new session as a `session_digest`.
+
+## Memory Tiers at a Glance
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Active Session (Redis)                              │
+│  session:{session_id}     ← full conversation messages + metadata           │
+│  file:{session_id}:{id}   ← parsed Excel/CSV file payload                  │
+│  file:active:{session_id} ← pointer to most-recently uploaded file          │
+│  checkpoint:{session_id}  ← LangGraph state snapshot (clarification loop)  │
+│                           TTL: SESSION_TTL_MINUTES (default 30)             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                     │ on session end / TTL expire
+                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                   Long-Term Memory (DynamoDB)                               │
+│  Table: erp-agent-conversations                                             │
+│  PK: user_id  |  SK: session_id                                             │
+│  Attributes: summary, topics, message_count, queries_executed, ttl          │
+│                           TTL: DYNAMODB_TTL_DAYS (default 90)               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                     │ on new session start
+                     ▼
+           session_digest injected into system prompt
+           (last 5 sessions, compact summary format)
+```
+
+---
+
+## Tier 1: Redis Short-Term Memory
+
+`SessionStore` (in `src/core/sessions.py`) is the primary short-term store. Every ECS task shares the same Redis instance, so sessions survive task restarts and load-balancer routing changes.
+
+### Session Keys
+
+| Key pattern | TTL | Contents |
+|---|---|---|
+| `session:{session_id}` | `SESSION_TTL_MINUTES × 60 s` | Full `Session` object serialized as JSON — messages, timestamps, metadata |
+| `file:{session_id}:{file_id}` | `file_data_ttl_minutes × 60 s` | Parsed Excel/CSV payload (rows + metadata) |
+| `file:active:{session_id}` | `file_data_ttl_minutes × 60 s` | UUID of the most-recently uploaded file |
+| `checkpoint:{session_id}` | `redis_ttl_minutes × 60 s` | LangGraph state snapshot for clarification loop resume |
+| `schema:metadata` | 3600 s | Serialized `INFORMATION_SCHEMA` table/column cache |
+| `schema:summary` | 3600 s | Pre-built ~1500-token schema summary for the `understand` node |
+
+### Configuration
+
+| Setting | Default | Description |
+|---|---|---|
+| `SESSION_TTL_MINUTES` | `30` | Inactive session expiry (rolling; refreshed on every `save()`) |
+| `SESSION_MAX_MESSAGES` | `100` | Maximum messages kept per session; oldest are trimmed |
+| `MAX_HISTORY_MESSAGES` | `5` | Recent messages included in each LLM context call |
+
+### Session Lifecycle
+
+```python
+# Get or create — Redis-first, new session on miss
+session = await store.get_or_create(session_id, user_id)
+
+# Add a message — auto-trims to SESSION_MAX_MESSAGES
+session.add_message(role="user", content=question)
+session.add_message(role="assistant", content=response, metadata={
+    "sql": generated_sql,
+    "query_results": results[:50],  # trimmed for Redis size
+    "kpis": kpis,
+    "intent": "query",
+})
+
+# Persist with rolling TTL
+await store.save(session)
+
+# Retrieve last N messages for LLM context
+context = session.get_context(max_messages=5)
+# → [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+```
+
+### File Data Storage
+
+Uploaded Excel/CSV files are processed and stored separately from the conversation messages to keep the main session key small:
+
+```python
+await store.store_file_data(session_id, file_id, {
+    "rows": parsed_rows,
+    "metadata": {"filename": "report.xlsx", "columns": [...], "row_count": 1200},
+})
+
+# Retrieve in analyze_file node
+data = await store.get_file_data(session_id, file_id)
+active_id = await store.get_active_file_id(session_id)
+```
+
+---
+
+## Tier 2: DynamoDB Long-Term Memory
+
+`dynamodb_client.py` manages the `erp-agent-conversations` table, which stores one row per session after the session ends (user disconnects or Redis TTL expires).
+
+### Table Schema
+
+```
+Table: erp-agent-conversations
+  PK: user_id (S)
+  SK: session_id (S)
+  ─────────────────────────────────────────────
+  summary (S)            — compact session digest (SQL queries, KPIs, topics)
+  message_count (N)      — total messages in the session
+  queries_executed (N)   — number of SQL queries run
+  topics (SS)            — set of topics: "ingresos", "costos", "nomina", ...
+  first_message (S)      — ISO timestamp of first message
+  last_message (S)       — ISO timestamp of last message
+  ttl (N)                — Unix epoch for DynamoDB auto-delete (90 days)
+```
+
+The table uses **on-demand billing** (`PAY_PER_REQUEST`) and has a TTL attribute enabled on the `ttl` field. The estimated cost for 50 active users is under $1/month.
+
+### Session Summary Save
+
+```python
+await save_session_summary(
+    user_id=user_id,
+    session_id=session_id,
+    summary=session.build_context_digest(),
+    message_count=stats["message_count"],
+    queries_executed=stats["queries_executed"],
+    topics=stats["topics"],
+    first_message=stats["first_message"],
+    last_message=stats["last_message"],
+)
+```
+
+### Cross-Session History Load
+
+At the start of each new conversation, the agent fetches up to 10 recent session summaries for the user and builds a `session_digest` string:
+
+```python
+history = await get_user_history(user_id, limit=10)
+digest = build_cross_session_context(history)
+# → "## Sesiones anteriores del usuario
+#    - 2025-01-15: Pregunta: "ingresos totales Q4" | Resultado: 1 fila | KPIs: Total: $12.3M
+#    - 2025-01-14: Pregunta: "margen por material" | Resultado: 47 filas | ..."
+```
+
+The digest is injected into the system prompt so Claude can reference previous sessions:
+> *"In your last session on Jan 15, you asked about Q4 revenue — the total was $12.3M. Would you like to compare it with Q4 2023?"*
+
+---
+
+## MemoryManager
+
+`MemoryManager` (in `src/core/memory_manager.py`) is a thin coordinator that orchestrates both tiers from a single API. Get the singleton via `get_memory_manager()`.
+
+```python
+manager = get_memory_manager()
+
+# Save a completed turn to SessionStore
+await manager.save_turn(session_id, role="assistant", content=response, metadata={...})
+
+# Get recent messages for LLM context (max_turns=5 = MAX_HISTORY_MESSAGES)
+context = await manager.get_conversation_context(session_id, max_turns=5)
+
+# Get last successful query results for follow-up turns
+previous = await manager.get_previous_results(session_id)
+# → {"previous_query_results": [...], "previous_column_names": [...], "previous_kpis": {...}}
+
+# Save LangGraph state checkpoint (clarification loop interrupt/resume)
+await manager.save_checkpoint(session_id, state)
+checkpoint = await manager.load_checkpoint(session_id)
+await manager.clear_checkpoint(session_id)  # after successful turn
+```
+
+---
+
+## Session Digest: In-Session Context
+
+`Session.build_context_digest()` produces a compact summary of everything that happened within the **current** session. This is injected into the `session_digest` field of every prompt so the LLM always has a full picture regardless of how many messages have been trimmed from the sliding context window.
+
+```
+## Consultas realizadas en esta sesion
+1. Pregunta: "ingresos del ultimo periodo" | Resultado: 1 fila | KPIs: Total Ingresos: $8.2M
+2. Pregunta: "top 5 clientes por ventas" | Resultado: 5 filas | KPIs: Cliente 1: $1.4M
+3. Archivo: "presupuesto_2025.xlsx" (120 filas, periodo, cuenta, monto) | Pregunta: "analiza las desviaciones"
+4. Conversación: "cuál es la diferencia entre EBITDA y margen bruto?"
+```
+
+The digest tracks:
+- SQL queries: question, row count, top KPIs
+- File analysis: filename, column list, row count, question asked
+- General conversations: topic captured for cross-session context
+
+---
+
+## Cost Tracker Persistence
+
+Per-session LLM cost tracking (token counts, estimated USD cost) is persisted with a **Redis-first, DynamoDB fallback** strategy:
+
+1. After each node execution, cost data is written to `session:{session_id}` metadata in Redis.
+2. When the session ends, the aggregated cost is included in the DynamoDB session summary.
+3. If Redis is unavailable, the cost data falls back to DynamoDB directly.
+
+This ensures cost visibility survives Redis eviction under memory pressure.
+
+---
+
+## RBAC Overrides Table
+
+A second DynamoDB table, `erp-agent-rbac-overrides`, stores per-user module overrides independently of session memory:
+
+```
+Table: erp-agent-rbac-overrides
+  PK: user_key (S)  — format: "{tenant}#{user_id}"
+  ─────────────────────────────────────────────────
+  modules_added (SS)    — modules granted beyond the base role
+  modules_removed (SS)  — modules revoked from the base role
+  updated_by (S)        — admin who made the change
+  updated_at (S)        — ISO timestamp
+```
+
+These overrides are applied at login time via `enrich_principal_with_overrides()` and are entirely independent of the conversation memory tiers.
+
+<Tip>
+  Both DynamoDB tables are created automatically on first startup if they do not exist. The `ensure_table_exists()` and `ensure_rbac_overrides_table()` functions run at application startup and are idempotent — safe to call on every deploy.
+</Tip>

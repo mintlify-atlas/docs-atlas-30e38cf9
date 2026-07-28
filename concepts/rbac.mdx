@@ -1,0 +1,234 @@
+---
+title: "Role-Based Access Control: Roles, Modules, and Enforcement"
+sidebarTitle: "RBAC"
+description: "How the ERP agent enforces role-based access with Cognito groups, DynamoDB overrides, module-gated tables, and row-level centro_beneficio scoping."
+---
+
+The ERP Financial Agent enforces access at three levels: **role-level** (which actions a user can take), **module-level** (which ERP data domains and fact tables they can query), and **row-level** (which `centro_beneficio` codes are visible). All three levels are resolved once per request from Cognito claims into an immutable `Principal` object that travels through both the outer conversation and inner SQL pipeline graphs.
+
+## Roles
+
+The system defines seven roles — five active in v1, two pre-designed and inactive:
+
+| Role | Rank | Status | Description |
+|---|---|---|---|
+| `platform_admin` | 100 | ✅ Active | Vendor super-admin. Cross-tenant operations, all permissions, all modules. |
+| `org_admin` | 80 | ✅ Active | Customer-side administrator. User management, RBAC assignment, full financial data. |
+| `finance_lead` | 60 | ✅ Active | CFO / Controller. Full financial data access, all agent actions, no user management. |
+| `analyst` | 40 | ✅ Active | Financial / data analyst. Agent + export + file upload, assigned modules only. |
+| `viewer` | 20 | ✅ Active | Read-only consumer. Chat + charts for assigned modules. No export or raw SQL. |
+| `auditor` | 50 | 🔒 Inactive | External auditor. Read-only + audit log. Time-boxed. |
+| `nomina_officer` | 30 | 🔒 Inactive | Payroll / HR officer. Only the `nomina` module. |
+
+To activate `auditor` or `nomina_officer`, set `active=True` in the `ROLE_CATALOG` in `src/core/rbac/catalog.py`.
+
+---
+
+## Permissions
+
+Each role grants a `frozenset[Permission]`. Permissions use dotted namespaced names:
+
+```python
+class Permission(StrEnum):
+    # Core agent usage
+    CHAT_QUERY         = "chat.query"        # ask the text-to-SQL agent
+    VIZ_CREATE         = "viz.create"        # generate charts
+    FEEDBACK_SUBMIT    = "feedback.submit"   # thumbs up/down
+    SQL_VIEW_RAW       = "sql.view_raw"      # see generated SQL in responses
+    DATA_EXPORT        = "data.export"       # download results to Excel/CSV
+    FILE_UPLOAD        = "file.upload"       # upload Excel/CSV for analysis
+    HISTORY_VIEW_ALL   = "history.view_all"  # see other users' history
+
+    # Administration (scoped to the caller's tenant)
+    ADMIN_USERS_READ   = "admin.users.read"
+    ADMIN_USERS_WRITE  = "admin.users.write"
+    ADMIN_AUDIT_READ   = "admin.audit.read"
+    ADMIN_RBAC_ASSIGN  = "admin.rbac.assign"  # change role / modules
+
+    # Platform (vendor) level — cross-tenant
+    PLATFORM_MANAGE    = "platform.manage"
+```
+
+### Permission Bundles per Role
+
+<Tabs>
+  <Tab title="viewer">
+    `chat.query` · `viz.create` · `feedback.submit`
+  </Tab>
+  <Tab title="analyst / finance_lead">
+    All viewer permissions **+** `sql.view_raw` · `data.export` · `file.upload`
+  </Tab>
+  <Tab title="org_admin">
+    All analyst permissions **+** `history.view_all` · `admin.users.read` · `admin.users.write` · `admin.audit.read` · `admin.rbac.assign`
+  </Tab>
+  <Tab title="platform_admin">
+    **All permissions** including `platform.manage`
+  </Tab>
+</Tabs>
+
+---
+
+## Data Modules
+
+Modules gate fact tables and views. Dimension / lookup tables (`ia_dm_*`) are **never** gated — they contain labels (client names, cost center codes) that every authenticated user may reference in JOINs.
+
+```python
+class Module(StrEnum):
+    INGRESOS     = "ingresos"      # ventas / facturación
+    COSTOS       = "costos"        # costos por centro, costo de venta
+    NOMINA       = "nomina"        # add-on to COSTOS: exposes COSTOS MANO DE OBRA
+    PRESUPUESTOS = "presupuestos"  # budget vs actual
+    PAGOS        = "pagos"         # payment gateway transactions
+    PRODUCCION   = "produccion"    # manufacturing orders, unit production cost
+    COMPRAS      = "compras"       # purchase orders, delivery plan
+    INVENTARIO   = "inventario"    # material documents / movements
+    LOGISTICA    = "logistica"     # transport documents / stages
+```
+
+### Module → Fact Table Mapping
+
+| Module | Gated Fact Tables |
+|---|---|
+| `ingresos` | `ia_fct_ingresos`, `ia_fct_gastos_costos_ingresos`, `ia_fct_gastos_costos_ingresos_balance`, `ia_fct_ingresos_final` |
+| `costos` | `ia_fct_costos_centros`*, `vista_rentabilidad_material`, `vw_costo_venta*`, `vw_driver_cantidades`, `ia_fct_gastos_costos_ingresos`, `ia_fct_gastos_costos_ingresos_balance` |
+| `nomina` | Same cost fact tables — controls visibility of `COSTOS MANO DE OBRA` accounts |
+| `presupuestos` | `ia_fct_ingresos_presupuestos`, `ia_fct_gastos_costos_ingresos_presupuestos`, `ia_fct_gastos_costos_ingresos_balance_presupuestos` |
+| `pagos` | `t_fsj_transacciones_pago_unificada`, `t_fsj_breb`, `t_fsj_orders_report_rappi`, `t_fsj_reporte_comercio_transaccion_redeban`, `t_fsj_reserve_release_mercado_pago_libre`, `t_fsj_wompi`, `t_fsj_transacciones_pos` |
+| `produccion` | `ia_fct_orden_fabricacion_cabecera/detalle/movimientos`, `vw_costo_produccion_unitario*` |
+| `compras` | `ia_fct_cabecera_pedidos_compras`, `ia_fct_detalle_pedidos_compras`, `ia_fct_historial_documentos_compra`, `ia_fct_plan_entregas_pedidos` |
+| `inventario` | `ia_fct_cabecera_documentos_material`, `ia_fct_cabecera/detalle_movimientos_material`, `ia_fct_inventario_materiales_centro`, `ia_fct_movimientos_materiales`, `vw_stock_material`, `vw_cobertura_inventario`, `ia_fct_metricas_inventario` |
+| `logistica` | `ia_fct_cabecera/detalle_documentos_transporte`, `ia_fct_etapas_transporte` |
+
+<Note>
+  `*ia_fct_costos_centros` no longer exists in the live database. It remains in the module mapping for historical reference only. All cost queries should use `ia_fct_gastos_costos_ingresos_balance`.
+</Note>
+
+---
+
+## The Principal Object
+
+`Principal` is an immutable frozen dataclass resolved once per request. It carries the user's **effective** access — after role resolution, DynamoDB overrides, and Cognito claim parsing.
+
+```python
+@dataclass(frozen=True, slots=True)
+class Principal:
+    user_id: str
+    username: str
+    email: str
+    tenant: str
+    role: RoleName
+    cognito_groups: tuple[str, ...]
+    permissions: frozenset[Permission]
+    modules: frozenset[Module]
+    allowed_tables: frozenset[str]      # ALWAYS_ALLOWED + gated tables for modules
+    labor_cost_restricted: bool         # COSTOS without NOMINA → hide labor accounts
+    allowed_cebes: frozenset[str]       # empty = no restriction; non-empty = WHERE IN
+    allowed_tenants: frozenset[str]     # cross-instance access list
+    unknown_groups: tuple[str, ...]     # unrecognized Cognito groups (for auditing)
+
+    def has(self, permission: Permission) -> bool: ...
+    def can_query_module(self, module: Module) -> bool: ...
+    def can_access_instance(self, expected_tenant: str) -> bool: ...
+```
+
+---
+
+## Principal Resolution Flow
+
+<Steps>
+  <Step title="Extract Cognito claims">
+    The FastAPI dependency `get_current_user` verifies the JWT and extracts `user_id`, `username`, `email`, `groups` (Cognito group memberships), `custom:tenantId`, `custom:data_scope`, and `custom:tenants`.
+  </Step>
+  <Step title="Pick effective role">
+    `_pick_role(groups)` maps each Cognito group to a `RoleName` using `GROUP_TO_ROLE`. If multiple groups match, the **highest-rank** role wins. If no group matches, `DEFAULT_ROLE` (`viewer`) is assigned.
+
+    ```python
+    GROUP_TO_ROLE = {
+        "platform_admin": RoleName.PLATFORM_ADMIN,
+        "org_admin":      RoleName.ORG_ADMIN,
+        "finance_lead":   RoleName.FINANCE_LEAD,
+        "analyst":        RoleName.ANALYST,
+        "viewer":         RoleName.VIEWER,
+        # Legacy mappings — backward compatibility
+        "admin":          RoleName.ORG_ADMIN,
+        "admins":         RoleName.ORG_ADMIN,
+        "administrators": RoleName.ORG_ADMIN,
+    }
+    ```
+  </Step>
+  <Step title="Resolve modules and tables">
+    `resolve_module_set(role_def.modules)` expands the `ALL_MODULES` sentinel if present. `tables_for_modules(modules)` computes `ALWAYS_ALLOWED_TABLES ∪ gated_tables_for_modules`.
+  </Step>
+  <Step title="Apply DynamoDB overrides">
+    `enrich_principal_with_overrides(principal)` fetches the `erp-agent-rbac-overrides` DynamoDB table for `tenant#user_id`. Applied formula: `effective_modules = (role_modules ∪ added) \ removed`. Falls back to the original Principal on any error — DynamoDB unavailability never blocks login.
+  </Step>
+  <Step title="Parse row-level scopes">
+    `custom:data_scope` is parsed into `allowed_cebes` (comma-separated list; prefix `cebes:` stripped). `custom:tenants` is parsed into `allowed_tenants`.
+  </Step>
+</Steps>
+
+---
+
+## Labor Cost Restriction
+
+The `NOMINA` module is an **add-on** to `COSTOS`. A user who has `COSTOS` but not `NOMINA` has `labor_cost_restricted = True`. The schema linker and SQL validator then hide any account where:
+
+```sql
+ia_dm_cuentas.tipo_costo = 'COSTOS MANO DE OBRA'
+```
+
+This implements payroll segregation of duties without requiring a separate table — the filter is enforced at query generation time inside the agent.
+
+```python
+# In _build_principal():
+labor_restricted = Module.COSTOS in modules and Module.NOMINA not in modules
+```
+
+---
+
+## Row-Level Scoping: allowed_cebes
+
+When `allowed_cebes` is a non-empty frozenset, the SQL generator injects a `WHERE centro_beneficio IN (...)` clause — or an equivalent filter — into every query that touches tables with a `centro_beneficio` column. An empty frozenset means no row-level restriction.
+
+```python
+# Parsed from custom:data_scope Cognito claim
+def _parse_allowed_cebes(data_scope: str) -> frozenset[str]:
+    # Accepts: "" | "1000,2000" | "cebes:1000,2000"
+    value = data_scope.split(":", 1)[-1] if ":" in data_scope else data_scope
+    return frozenset(v.strip() for v in value.split(",") if v.strip())
+```
+
+---
+
+## Shadow Mode vs Enforcement
+
+RBAC operates in two modes controlled by the `rbac_enforce` setting:
+
+| Mode | Behavior |
+|---|---|
+| `rbac_enforce=false` (shadow) | Permissions are resolved and logged, but no requests are blocked. Useful during initial rollout. |
+| `rbac_enforce=true` (enforced) | Any request lacking the required permission raises `PermissionDeniedError`, which the API layer maps to HTTP 403 and the agent node maps to a polite refusal in chat. |
+
+---
+
+## Role Assignment Rules
+
+An admin can only assign a role to another user if:
+1. They hold the `admin.rbac.assign` permission, **and**
+2. Their own role's `rank` is **strictly higher** than the target role's rank.
+
+This prevents an `org_admin` (rank 80) from minting a `platform_admin` (rank 100).
+
+```python
+def role_can_be_assigned_by(*, assigner: Principal, target_role: RoleName) -> bool:
+    if not has_permission(assigner, Permission.ADMIN_RBAC_ASSIGN):
+        return False
+    return (
+        ROLE_CATALOG[assigner.role].rank > ROLE_CATALOG[target_role].rank
+        or assigner.role == RoleName.PLATFORM_ADMIN
+    )
+```
+
+<Warning>
+  `resolve_principal()` is designed to **never raise**. On any unexpected input it logs the exception and returns a least-privilege `viewer` principal — so a bug in RBAC code cannot lock all users out. Authorization still fails closed because `viewer` has the minimum permission set.
+</Warning>

@@ -1,0 +1,249 @@
+---
+title: "Database Configuration for the ERP Financial Agent"
+sidebarTitle: "Database"
+description: "MySQL connection pooling, async driver setup, circuit breaker, read-only enforcement, schema registry indexing, and health-check details for the ERP Financial Agent."
+---
+
+The ERP Financial Agent connects to a single MySQL database that holds migrated SAP/ERP financial tables. All access is **read-only** — the agent generates and executes `SELECT` statements only. Every connection is managed through a singleton `AsyncEngine` built with SQLAlchemy and the `aiomysql` async driver.
+
+---
+
+## Supported database
+
+| Property | Value |
+|---|---|
+| Engine | MySQL 8.0 |
+| Driver | `aiomysql` (async) |
+| ORM layer | SQLAlchemy `AsyncEngine` / `AsyncSession` |
+| Deployment | AWS RDS (Multi-AZ recommended for production) |
+| Default database name | `iafinagent` |
+| Default port | `3306` |
+
+---
+
+## Connection configuration
+
+Set these variables in `.env` (or as ECS environment variables in production):
+
+<ParamField path="DB_HOST" type="string" required>
+  RDS endpoint hostname, e.g. `iafinagent.choi0eaq2mr7.us-east-1.rds.amazonaws.com`.
+</ParamField>
+
+<ParamField path="DB_PORT" type="integer" default="3306">
+  MySQL port. Change only if your instance uses a custom port.
+</ParamField>
+
+<ParamField path="DB_NAME" type="string" required>
+  Target database (schema) name. The default used across the CloudFormation stack is `iafinagent`.
+</ParamField>
+
+<ParamField path="DB_USER" type="string" required>
+  Database login username. Create a dedicated user with `SELECT`-only grants; do not use the RDS master user.
+</ParamField>
+
+<ParamField path="DB_PASSWORD" type="string" required>
+  Database password. In production this value is injected at container startup from AWS Secrets Manager via `DB_PASSWORD_SECRET_ARN`. See [AWS Setup](/configuration/aws-setup) for details.
+</ParamField>
+
+The `Settings` class in `src/core/config.py` exposes a computed `database_url` property that assembles the full async connection string:
+
+```python src/core/config.py
+@property
+def database_url(self) -> str:
+    """Construct async database URL (aiomysql driver)."""
+    return f"mysql+aiomysql://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
+```
+
+---
+
+## Connection pool
+
+The singleton engine is created once at startup by `get_engine()` in `src/core/database.py` and reused for every request. The pool constants are:
+
+| Pool parameter | Value | Notes |
+|---|---|---|
+| `pool_size` | `5` | Persistent connections kept open |
+| `max_overflow` | `5` | Extra connections allowed above pool_size (burst) |
+| `pool_timeout` | `15 s` | Time to wait for a free connection from the pool |
+| `pool_recycle` | `295 s` | Connection is retired before RDS `wait_timeout` (typically 300 s) |
+| `pool_pre_ping` | `true` | Issues `SELECT 1` before each checkout to evict stale connections |
+
+```python src/core/database.py
+_engine = create_async_engine(
+    settings.database_url,
+    pool_size=5,
+    max_overflow=5,
+    pool_timeout=15,
+    pool_recycle=295,
+    pool_pre_ping=True,
+    connect_args={"connect_timeout": settings.db_connect_timeout},
+    echo=settings.log_level == "DEBUG",
+)
+```
+
+<Tip>
+  Set `LOG_LEVEL=DEBUG` to enable SQLAlchemy query echo. Every generated SQL statement and its parameters will appear in the structured log output — useful for debugging, but very noisy in production.
+</Tip>
+
+---
+
+## Timeout settings
+
+Three independent timeouts govern the MySQL connection lifecycle. All are tunable via environment variables:
+
+<ParamField path="DB_CONNECT_TIMEOUT" type="integer" default="10">
+  TCP handshake and authentication timeout in seconds. Passed as `connect_timeout` in `connect_args` to `aiomysql`. The default of `10` seconds is conservative enough for cross-AZ RDS connections.
+</ParamField>
+
+<ParamField path="DB_READ_TIMEOUT" type="integer" default="30">
+  Per-read timeout in seconds. Controls how long the driver waits for data from the server on a single network read.
+</ParamField>
+
+<ParamField path="DB_WRITE_TIMEOUT" type="integer" default="30">
+  Per-write timeout in seconds. Applies to write operations (used only if the application is ever extended beyond read-only access).
+</ParamField>
+
+Additionally, `QUERY_TIMEOUT_SECONDS` (default `30`) is enforced at the application layer — the agent cancels any query that has not returned within this wall-clock limit.
+
+---
+
+## Circuit breaker
+
+A circuit breaker wraps database operations to prevent cascading failures when RDS becomes unavailable. Configuration:
+
+<ParamField path="CIRCUIT_BREAKER_FAILURE_THRESHOLD" type="integer" default="5">
+  Number of consecutive failures required to trip the circuit breaker (open state). While open, requests fail fast without attempting a database connection.
+</ParamField>
+
+<ParamField path="CIRCUIT_BREAKER_RECOVERY_TIMEOUT" type="integer" default="60">
+  Seconds after which the circuit breaker transitions from open to half-open and allows a single probe request through. If the probe succeeds the circuit closes; if it fails the timer resets.
+</ParamField>
+
+---
+
+## Read-only enforcement
+
+The agent exclusively executes `SELECT` statements. Enforcement happens at two layers:
+
+<Tabs>
+  <Tab title="SQL validator">
+    The `sql_validation_enabled` flag (default `true`) routes every generated SQL string through `sqlglot` before execution. The validator:
+
+    - Parses the statement and checks the AST root node type.
+    - Rejects any statement that is not a `SELECT` — this includes `INSERT`, `UPDATE`, `DELETE`, `DROP`, `CREATE`, `ALTER`, `TRUNCATE`, and any stored-procedure call.
+    - Returns a structured error to the self-correction loop, which attempts to rewrite the query (up to `MAX_CORRECTION_ATTEMPTS = 3` times).
+
+    ```python
+    # Validation is invoked inside the SQL generation node
+    if settings.sql_validation_enabled:
+        validate_sql(generated_sql)   # raises if DML/DDL detected
+    ```
+  </Tab>
+  <Tab title="Database user grants">
+    The recommended MySQL user for the agent is created with `SELECT`-only grants:
+
+    ```sql
+    CREATE USER 'erp_agent'@'%' IDENTIFIED BY '<password>';
+    GRANT SELECT ON iafinagent.* TO 'erp_agent'@'%';
+    FLUSH PRIVILEGES;
+    ```
+
+    Even if the SQL validator were bypassed, the database would reject any write attempt with a permissions error.
+  </Tab>
+</Tabs>
+
+---
+
+## Schema registry and FAISS index
+
+At startup the agent reads `INFORMATION_SCHEMA` to build a semantic index of the database schema. This index is used by the `schema_linker` node to select the most relevant tables and columns for each natural-language query.
+
+<Steps>
+  <Step title="Read INFORMATION_SCHEMA">
+    The schema registry queries `INFORMATION_SCHEMA.COLUMNS` and `INFORMATION_SCHEMA.TABLES` to enumerate all tables and columns in `DB_NAME`.
+  </Step>
+
+  <Step title="Enrich with domain knowledge">
+    Each table/column entry is enriched with human-readable descriptions from the YAML schema catalog in `yaml_schemas/*.yml` (when `USE_GENERATED_SCHEMA_CATALOG=true`, the default).
+  </Step>
+
+  <Step title="Embed with Amazon Titan">
+    Enriched schema chunks are embedded using `BEDROCK_EMBEDDING_MODEL_ID` (`amazon.titan-embed-text-v2:0`), producing 1024-dimensional vectors (`EMBEDDING_DIMENSIONS=1024`).
+  </Step>
+
+  <Step title="Persist FAISS index">
+    The vectors are stored in a FAISS flat index on disk at the path specified by `FAISS_INDEX_DIR` (default `data/faiss_index`). The index is loaded from disk on subsequent startups if it exists, avoiding re-embedding on every restart.
+  </Step>
+
+  <Step title="Retrieval at query time">
+    For each user query the `schema_linker` node embeds the question and performs an approximate nearest-neighbour search, returning the top-`SCHEMA_TOP_K` (default `5`) schema chunks and top-`PATTERNS_TOP_K` (default `3`) few-shot query patterns.
+  </Step>
+</Steps>
+
+---
+
+## Query limits
+
+<ParamField path="MAX_QUERY_ROWS" type="integer" default="10000">
+  Hard ceiling on rows returned from any single SELECT. The database layer adds a `LIMIT` clause if the generated SQL omits one, and truncates result sets that exceed this value.
+</ParamField>
+
+<ParamField path="QUERY_TIMEOUT_SECONDS" type="integer" default="30">
+  Wall-clock timeout for SQL execution enforced at the application layer. Queries running longer than this are cancelled and the agent returns a timeout error to the user.
+</ParamField>
+
+---
+
+## Health check
+
+The FastAPI application exposes a `GET /health` endpoint that verifies database connectivity by running `SELECT 1`:
+
+```python src/core/database.py
+async def verify_connectivity() -> bool:
+    """Check database connectivity with SELECT 1."""
+    try:
+        engine = get_engine()
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))
+        return True
+    except Exception as exc:
+        logger.error("Database connectivity check failed", error=str(exc))
+        return False
+```
+
+The endpoint returns JSON with a `database` key:
+
+<CodeGroup>
+
+```json Connected
+{
+  "database": "connected"
+}
+```
+
+```json Disconnected
+{
+  "database": "disconnected"
+}
+```
+
+</CodeGroup>
+
+The ALB target group in the CloudFormation stack polls `GET /health` every 30 seconds with a 15-second timeout. A task is marked unhealthy after 3 consecutive failures and replaced automatically.
+
+---
+
+## Retry configuration
+
+Transient database errors (e.g. connection refused during an RDS failover) are retried with exponential back-off:
+
+| Variable | Default | Description |
+|---|---|---|
+| `MAX_RETRIES_DB` | `2` | Maximum retry attempts for database operations |
+| `RETRY_BACKOFF_MULTIPLIER` | `1` | Back-off multiplier applied between retries |
+| `RETRY_BACKOFF_MIN` | `2 s` | Minimum wait before the first retry |
+| `RETRY_BACKOFF_MAX` | `10 s` | Maximum wait cap between retries |
+
+<Note>
+  Retry logic is additive with the circuit breaker. If the circuit is already open, retries are skipped and the request fails immediately rather than waiting out the full back-off sequence.
+</Note>

@@ -1,0 +1,118 @@
+{
+  "projectType": "saas",
+  "projectName": "ERP Financial Agent",
+  "projectDescription": "A conversational Text-to-SQL AI assistant that lets business users query SAP/ERP financial data in natural language, powered by LangGraph, AWS Bedrock (Claude), and a React chat interface.",
+  "theme": "luma",
+  "primaryColor": "#4F6AF5",
+  "lightColor": "#EEF1FE",
+  "darkColor": "#1E2A6B",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/environment-variables",
+              "configuration/aws-setup",
+              "configuration/database"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/agent-pipeline",
+              "concepts/schema-registry",
+              "concepts/rbac",
+              "concepts/multi-tenancy",
+              "concepts/memory"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/docker",
+              "deployment/aws-ecs",
+              "deployment/tenant-provisioning",
+              "deployment/monitoring"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Chat & WebSocket",
+            "pages": [
+              "api/chat",
+              "api/websocket"
+            ]
+          },
+          {
+            "group": "Schema Exploration",
+            "pages": [
+              "api/schema"
+            ]
+          },
+          {
+            "group": "Admin & Identity",
+            "pages": [
+              "api/admin",
+              "api/me",
+              "api/instances"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Natural language to SQL conversion over SAP/ERP data (Spanish)",
+    "Two-level LangGraph pipeline: outer conversation graph + inner SQL pipeline",
+    "Automatic chart generation (bar, line, pie, horizontal bar, stacked bar) and KPI cards",
+    "Self-correcting SQL with up to 3 retry attempts via error handler node",
+    "Human-in-the-loop (HITL) confirmation for expensive or destructive queries",
+    "Role-based access control (RBAC) with per-module data permissions",
+    "Multi-tenant isolation: each customer gets its own instance with tenant-scoped RBAC",
+    "Short-term session memory (Redis) + long-term conversation history (DynamoDB, 90-day TTL)",
+    "Semantic schema linking with FAISS vector store + Amazon Titan V2 embeddings",
+    "File upload analysis (Excel/CSV) with code execution sandbox",
+    "Time-series forecasting via StatsForecast",
+    "CSV/Excel export of query results",
+    "Prometheus metrics + Grafana dashboards + LangSmith tracing",
+    "AWS Cognito JWT authentication with rate limiting (slowapi)"
+  ],
+  "publicApiSurface": [
+    "POST /chat — submit a question; returns SQL, chart config, KPIs, and narrative",
+    "WebSocket /ws/chat — streaming chat with per-node progress events",
+    "GET /health — health check (DB connectivity + feature flags)",
+    "GET /metrics — Prometheus-format metrics scrape endpoint",
+    "GET /schema/tables — list all ERP tables in the schema registry",
+    "GET /schema/tables/{table_name} — detailed table metadata (columns, DDL, business notes)",
+    "POST /schema/search — semantic search over table descriptions",
+    "GET /api/me — current user identity, role, permissions, and modules",
+    "GET /api/admin/users — list Cognito users (admin only)",
+    "POST /api/admin/users — create a Cognito user (admin only)",
+    "GET /api/admin/users/{username} — user detail including groups and modules",
+    "PUT /api/admin/users/{username} — update user attributes",
+    "DELETE /api/admin/users/{username} — delete user",
+    "POST /api/admin/users/{username}/groups — add user to Cognito group",
+    "DELETE /api/admin/users/{username}/groups/{group} — remove user from group",
+    "POST /api/admin/users/{username}/modules — assign data modules to user",
+    "POST /api/admin/users/{username}/instances — assign tenant instances to user",
+    "GET /api/admin/costs — LLM token cost summary (global, by user, by node)",
+    "GET /api/instances — list tenant instances (admin only)",
+    "POST /api/instances — provision a new tenant instance",
+    "POST /api/upload — upload Excel/CSV file for analysis"
+  ]
+}

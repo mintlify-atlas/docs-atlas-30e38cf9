@@ -1,0 +1,276 @@
+---
+title: "Environment Variables Reference — ERP Financial Agent"
+sidebarTitle: "Env Variables"
+description: "Complete reference for every environment variable in the ERP Financial Agent Settings class, with defaults, types, and a ready-to-use .env template."
+---
+
+Every setting the ERP Financial Agent reads at startup is declared in `src/core/config.py` as a Pydantic `Settings` field. Values are loaded from a `.env` file first, then from real environment variables — with real environment variables taking precedence. Required fields (marked with `...` in the source) have no default and will cause the app to refuse to start if they are absent.
+
+<Warning>
+  Never commit a populated `.env` file to version control. Copy `.env.example` to `.env`, fill in your values, and add `.env` to `.gitignore`.
+</Warning>
+
+---
+
+## Required variables
+
+These fields have no default value. The application **will not start** without them.
+
+<ParamField path="DB_HOST" type="string" required>
+  Hostname of the MySQL database server. For AWS RDS use the full endpoint, e.g. `iafinagent.choi0eaq2mr7.us-east-1.rds.amazonaws.com`.
+</ParamField>
+
+<ParamField path="DB_PORT" type="integer" default="3306">
+  MySQL port. Change only if your RDS instance is on a non-standard port.
+</ParamField>
+
+<ParamField path="DB_NAME" type="string" required>
+  Target database (schema) name. The default database used in the CloudFormation stack is `iafinagent`.
+</ParamField>
+
+<ParamField path="DB_USER" type="string" required>
+  Database login username. The CloudFormation stack defaults to `admin`.
+</ParamField>
+
+<ParamField path="DB_PASSWORD" type="string" required>
+  Database password. In production this value is injected from AWS Secrets Manager at container startup; set `DB_PASSWORD_SECRET_ARN` instead and leave this blank in the ECS environment.
+</ParamField>
+
+<ParamField path="COGNITO_USER_POOL_ID" type="string" required>
+  AWS Cognito User Pool ID that issues JWT tokens. Format: `us-east-1_XXXXXXXXX`. The `CognitoJWTValidator` derives the JWKS endpoint URL from this value.
+</ParamField>
+
+---
+
+## AWS / LLM
+
+<ParamField path="AWS_REGION" type="string" default="us-east-1">
+  AWS region where Bedrock, Cognito, DynamoDB, and Secrets Manager resources live. Cross-region inference profiles (`us.anthropic.*`) require this to be `us-east-1`.
+</ParamField>
+
+<ParamField path="BEDROCK_MODEL_ID" type="string" default="us.anthropic.claude-sonnet-4-5-20250929-v1:0">
+  Bedrock cross-region inference profile used for general LLM calls (intent classification, SQL generation, explanations). Must be a valid inference profile ID, not a base model ID.
+</ParamField>
+
+<ParamField path="BEDROCK_REASONING_MODEL_ID" type="string" default="us.anthropic.claude-sonnet-5">
+  Bedrock inference profile for reasoning-intensive graph nodes. Billed at a higher token rate than the general model; see `COST_PER_1K_INPUT_TOKENS_REASONING`.
+</ParamField>
+
+<ParamField path="BEDROCK_EMBEDDING_MODEL_ID" type="string" default="amazon.titan-embed-text-v2:0">
+  Bedrock model for generating text embeddings (FAISS schema registry, semantic search). Produces 1024-dimensional vectors by default (`EMBEDDING_DIMENSIONS`).
+</ParamField>
+
+<ParamField path="AWS_ACCOUNT_ID" type="string">
+  Optional. Your 12-digit AWS account ID. Required by some IAM resource ARN constructions and tenant-panel features. When running on ECS the value is available from instance metadata.
+</ParamField>
+
+<ParamField path="DB_PASSWORD_SECRET_ARN" type="string">
+  Optional. Full ARN of the Secrets Manager secret that stores the database password, e.g. `arn:aws:secretsmanager:us-east-1:123456789012:secret:erp-agent/db-password`. When set, `resolve_secrets()` fetches the real password at startup and injects it into `DB_PASSWORD`. Leave unset for local development.
+</ParamField>
+
+---
+
+## Session / Cache
+
+<ParamField path="REDIS_URL" type="string" default="redis://localhost:6379/0">
+  Full Redis connection URL. In the ECS deployment this is derived automatically from the ElastiCache cluster endpoint: `redis://<cluster-endpoint>:6379/0`.
+</ParamField>
+
+<ParamField path="REDIS_TTL_MINUTES" type="integer" default="30">
+  Default TTL applied to all Redis keys (session checkpoints, rate-limit counters). Expired keys are evicted automatically by Redis.
+</ParamField>
+
+<ParamField path="SESSION_TTL_MINUTES" type="integer" default="30">
+  How long an idle conversation session is kept alive. Counted from the last message in the session.
+</ParamField>
+
+<ParamField path="SESSION_MAX_MESSAGES" type="integer" default="100">
+  Hard ceiling on the number of messages stored per session. Older messages are dropped when the limit is reached.
+</ParamField>
+
+---
+
+## Agent behaviour
+
+<ParamField path="MAX_HISTORY_MESSAGES" type="integer" default="5">
+  Number of prior conversation turns injected into each LLM prompt as context. Increasing this value improves multi-turn coherence but raises token cost per request.
+</ParamField>
+
+<ParamField path="MAX_CORRECTION_ATTEMPTS" type="integer" default="3">
+  Maximum self-correction retries when the SQL validator rejects a generated query. After this many attempts the agent returns an error to the user.
+</ParamField>
+
+<ParamField path="SQL_VALIDATION_ENABLED" type="boolean" default="true">
+  Enables `sqlglot`-based validation of every generated SQL statement before execution. Disable only in development when iterating on prompt templates.
+</ParamField>
+
+<ParamField path="HITL_ENABLED" type="boolean" default="true">
+  Enables Human-in-the-Loop confirmation before executing expensive queries. When `true`, queries whose estimated cost exceeds the threshold are paused and sent to the frontend for user approval.
+</ParamField>
+
+<ParamField path="MAX_QUERY_ROWS" type="integer" default="10000">
+  Maximum number of rows the database layer will return from any single SELECT. Results are truncated at this limit to protect memory.
+</ParamField>
+
+<ParamField path="QUERY_TIMEOUT_SECONDS" type="integer" default="30">
+  Wall-clock timeout for SQL execution. Queries that exceed this limit are cancelled and the agent reports a timeout error.
+</ParamField>
+
+---
+
+## RBAC
+
+<ParamField path="RBAC_ENFORCE" type="boolean" default="false">
+  Controls whether RBAC policy violations actually block requests. When `false` (shadow mode) violations are logged as warnings but the request proceeds. Set to `true` in production only after verifying no false positives in the audit log. Maps to the `--rbac-enforce` CloudFormation parameter.
+</ParamField>
+
+<ParamField path="EXPECTED_TENANT" type="string" default="*">
+  Tenant slug this instance serves. `*` allows any tenant (backwards-compatible default). Set to a specific slug (e.g. `agripac`) to restrict access to Cognito users whose `custom:tenantId` claim matches.
+</ParamField>
+
+---
+
+## DynamoDB memory
+
+<ParamField path="DYNAMODB_ENABLED" type="boolean" default="true">
+  Enables long-term conversation memory in DynamoDB. When `true`, the agent writes conversation turns to the `erp-agent-conversations` table so context persists across browser sessions.
+</ParamField>
+
+<ParamField path="DYNAMODB_TTL_DAYS" type="integer" default="90">
+  Number of days before DynamoDB automatically expires conversation records. The TTL attribute on each item is set to `now + DYNAMODB_TTL_DAYS`.
+</ParamField>
+
+---
+
+## File upload
+
+<ParamField path="MAX_UPLOAD_SIZE_MB" type="integer" default="10">
+  Maximum file size (in megabytes) accepted by the upload endpoint. Requests that exceed this limit are rejected with HTTP 413.
+</ParamField>
+
+<ParamField path="MAX_UPLOAD_ROWS" type="integer" default="50000">
+  Maximum number of rows accepted in a CSV or Excel upload. Files with more rows are rejected before parsing begins.
+</ParamField>
+
+---
+
+## Observability
+
+<ParamField path="LANGSMITH_API_KEY" type="string">
+  Optional. LangSmith API key for LLM call tracing. Tracing is disabled when this variable is absent.
+</ParamField>
+
+<ParamField path="LANGSMITH_PROJECT" type="string" default="erp-financial-agent">
+  LangSmith project name that traces are grouped under.
+</ParamField>
+
+<ParamField path="LANGCHAIN_TRACING_V2" type="boolean" default="false">
+  Enables LangChain's V2 tracing protocol. Set to `true` together with `LANGSMITH_API_KEY` to stream traces to LangSmith.
+</ParamField>
+
+<ParamField path="METRICS_ENABLED" type="boolean" default="true">
+  Enables Prometheus metrics collection. Metrics are exposed on the `/metrics` endpoint using the prefix `erp_agent`.
+</ParamField>
+
+<ParamField path="COST_TRACKING_ENABLED" type="boolean" default="true">
+  Enables per-request token cost tracking. Cost is computed using the `COST_PER_1K_*_TOKENS` settings and logged alongside every LLM invocation.
+</ParamField>
+
+---
+
+## API
+
+<ParamField path="API_CORS_ORIGINS" type="JSON array" default='["http://localhost:5173"]'>
+  JSON-encoded list of origins that the FastAPI CORS middleware will allow. Must be a valid JSON array string in `.env`. Example for local dev with both Vite ports: `["http://localhost:5173","http://localhost:5174"]`.
+</ParamField>
+
+<ParamField path="RATE_LIMIT_PER_MINUTE" type="integer" default="20">
+  Maximum requests per minute allowed per authenticated user. Requests beyond this limit receive HTTP 429.
+</ParamField>
+
+<ParamField path="RATE_LIMIT_PER_HOUR" type="integer" default="200">
+  Maximum requests per hour per authenticated user. Enforced independently of the per-minute limit.
+</ParamField>
+
+<ParamField path="ENVIRONMENT" type="string" default="development">
+  Runtime environment label. Accepted values include `development`, `staging`, and `production`. Used in log output and CloudWatch tagging.
+</ParamField>
+
+<ParamField path="LOG_LEVEL" type="string" default="INFO">
+  Python logging level. Set to `DEBUG` to enable SQLAlchemy query echo and verbose agent tracing. Accepted values: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`.
+</ParamField>
+
+---
+
+## Full `.env` example
+
+The snippet below mirrors `.env.example` from the repository root. Copy it, fill in the required fields, and remove the optional sections you don't need.
+
+```dotenv .env
+# ── AWS Bedrock ────────────────────────────────────────────────────────────────
+BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0
+BEDROCK_REASONING_MODEL_ID=us.anthropic.claude-sonnet-5
+BEDROCK_EMBEDDING_MODEL_ID=amazon.titan-embed-text-v2:0
+
+# ── Database (MySQL RDS) ───────────────────────────────────────────────────────
+DB_HOST=your-rds-host.region.rds.amazonaws.com
+DB_PORT=3306
+DB_NAME=iafinagent
+DB_USER=admin
+DB_PASSWORD=your-db-password
+
+# ── AWS ────────────────────────────────────────────────────────────────────────
+AWS_REGION=us-east-1
+AWS_ACCOUNT_ID=123456789012
+
+# ── Cognito ────────────────────────────────────────────────────────────────────
+COGNITO_USER_POOL_ID=us-east-1_2qpNBGCmb
+COGNITO_CLIENT_ID=70qcoifagu4tk20qnn2q8d9rjs
+
+# ── Secrets Manager (optional, production only) ────────────────────────────────
+# DB_PASSWORD_SECRET_ARN=arn:aws:secretsmanager:us-east-1:123456789012:secret:erp-agent/db-password
+
+# ── Redis ──────────────────────────────────────────────────────────────────────
+REDIS_URL=redis://localhost:6379/0
+REDIS_TTL_MINUTES=30
+SESSION_TTL_MINUTES=30
+SESSION_MAX_MESSAGES=100
+
+# ── Agent behaviour ────────────────────────────────────────────────────────────
+MAX_HISTORY_MESSAGES=5
+MAX_CORRECTION_ATTEMPTS=3
+SQL_VALIDATION_ENABLED=true
+HITL_ENABLED=true
+MAX_QUERY_ROWS=10000
+QUERY_TIMEOUT_SECONDS=30
+
+# ── RBAC ───────────────────────────────────────────────────────────────────────
+RBAC_ENFORCE=false
+EXPECTED_TENANT=*
+
+# ── DynamoDB memory ────────────────────────────────────────────────────────────
+DYNAMODB_ENABLED=true
+DYNAMODB_TTL_DAYS=90
+
+# ── File upload ────────────────────────────────────────────────────────────────
+MAX_UPLOAD_SIZE_MB=10
+MAX_UPLOAD_ROWS=50000
+
+# ── Observability ─────────────────────────────────────────────────────────────
+# LANGSMITH_API_KEY=your-langsmith-api-key
+# LANGSMITH_PROJECT=erp-financial-agent
+# LANGCHAIN_TRACING_V2=true
+METRICS_ENABLED=true
+COST_TRACKING_ENABLED=true
+
+# ── API ────────────────────────────────────────────────────────────────────────
+API_CORS_ORIGINS=["http://localhost:5173"]
+RATE_LIMIT_PER_MINUTE=20
+RATE_LIMIT_PER_HOUR=200
+ENVIRONMENT=development
+LOG_LEVEL=INFO
+```
+
+<Tip>
+  In production the ECS task definition injects `DB_PASSWORD` directly from Secrets Manager via the `secrets` block in the CloudFormation template — you do not need to set it as a plain-text environment variable.
+</Tip>

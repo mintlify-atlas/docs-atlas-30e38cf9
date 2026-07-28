@@ -1,0 +1,444 @@
+---
+title: "ERP Agent Tenant Instance Management API Reference"
+sidebarTitle: "Instances"
+description: "Manage ERP Financial Agent tenant instances: list provisioned tenants, trigger provisioning, and control ECS/RDS lifecycle via the admin API."
+---
+
+The Instances API provides administrators with full lifecycle control over tenant instances — isolated ECS services paired with dedicated MySQL schemas, each identified by a unique slug. All endpoints in this group are **restricted to the primary instance** (`expected_tenant="*"`) and require membership in the Cognito admin group. Calling these endpoints from a tenant instance returns `404`.
+
+<Note>
+  **Primary instance only.** Tenant stacks do not hold the `TenantPanelAccess`
+  IAM policy. Even if a tenant user somehow obtained admin Cognito group
+  membership, the IAM guard on the primary instance is the authoritative
+  enforcement layer — the application guard here is an additional safeguard.
+</Note>
+
+---
+
+## What is a tenant instance?
+
+Each customer of the ERP Financial Agent platform runs in a fully isolated tenant instance: a dedicated Amazon ECS service (`erp-agent-service-<tenant_id>`) inside its own ECS cluster (`erp-agent-cluster-<tenant_id>`), backed by a dedicated RDS MySQL database (`erp-rds-<tenant_id>`). Infrastructure is provisioned via a CloudFormation stack named `erp-agent-services-<tenant_id>`.
+
+Every provisioned instance is registered in a shared **DynamoDB tenant registry table** (`erp-agent-tenants`), which is the authoritative source of identity for all admin panel operations. Live ECS task counts and RDS status are fetched on-demand and overlaid on registry data — if AWS describe calls fail, the instance is still listed with `live_status: "unknown"` so no instance is silently hidden.
+
+<Tip>
+  New instances are **always born stopped** (`desiredCount=0`). After provisioning completes (~15 min), use the [Start Instance](#post-apiadmininstancestenant_idstart) endpoint or run `./scripts/<tenant_id>-up.sh` to bring the service online.
+</Tip>
+
+---
+
+## Authentication
+
+All `/api/admin/instances` endpoints require:
+
+1. A valid Cognito JWT in the `Authorization: Bearer <token>` header.
+2. Membership in the Cognito **admin group**.
+3. Requests must be routed through the **primary instance** — tenant instance deployments return `404` for all routes under this prefix.
+
+---
+
+## Rate limits
+
+| Endpoint | Limit |
+|---|---|
+| `GET /api/admin/instances` | 30 req / minute |
+| `POST /api/admin/instances` | 5 req / minute |
+| `POST /api/admin/instances/{tenant_id}/start` | 10 req / minute |
+| `POST /api/admin/instances/{tenant_id}/stop` | 10 req / minute |
+
+---
+
+## GET /api/admin/instances
+
+List all provisioned tenant instances registered in the DynamoDB `erp-agent-tenants` table, each enriched with live ECS task state and RDS instance status from AWS.
+
+### Response
+
+<ResponseField name="instances" type="TenantInstanceSummary[]" required>
+  Ordered list of tenant instance records.
+
+  <Expandable title="TenantInstanceSummary fields">
+    <ResponseField name="tenant_id" type="string" required>
+      Unique slug identifying the tenant. Lowercase alphanumeric with hyphens,
+      2–31 characters (e.g. `acme-corp`).
+    </ResponseField>
+
+    <ResponseField name="stack_name" type="string">
+      CloudFormation stack name, typically `erp-agent-services-<tenant_id>`.
+    </ResponseField>
+
+    <ResponseField name="rds_identifier" type="string">
+      RDS DB instance identifier, typically `erp-rds-<tenant_id>`.
+    </ResponseField>
+
+    <ResponseField name="alb_dns" type="string">
+      DNS name of the Application Load Balancer for this tenant's ECS service.
+      Empty until the provisioning workflow has completed.
+    </ResponseField>
+
+    <ResponseField name="admin_email" type="string">
+      Email address of the initial `org_admin` Cognito user created during
+      provisioning. Empty if none was supplied at provision time.
+    </ResponseField>
+
+    <ResponseField name="status" type="string">
+      Registry-recorded desired power state: `on` or `off`. Updated by the
+      start/stop endpoints; does not reflect transient ECS states.
+    </ResponseField>
+
+    <ResponseField name="live_status" type="string">
+      Real-time power state derived from ECS `desiredCount` and `runningCount`:
+      `on` (running = desired > 0), `off` (desired = 0), `starting`
+      (running < desired), or `unknown` (ECS describe call failed).
+    </ResponseField>
+
+    <ResponseField name="running_count" type="integer | null">
+      Number of currently running ECS tasks. `null` when the ECS describe call
+      could not be completed.
+    </ResponseField>
+
+    <ResponseField name="desired_count" type="integer | null">
+      Number of ECS tasks the service is currently targeting. `null` when the
+      ECS describe call could not be completed.
+    </ResponseField>
+
+    <ResponseField name="rds_status" type="string">
+      Current RDS DB instance status as reported by AWS: `available`, `stopped`,
+      `creating`, `stopping`, `starting`, etc. Empty when the RDS describe call
+      failed.
+    </ResponseField>
+
+    <ResponseField name="created_at" type="string">
+      ISO 8601 UTC timestamp of when the instance was first registered in
+      DynamoDB (e.g. `2024-11-15T14:32:00Z`).
+    </ResponseField>
+
+    <ResponseField name="updated_at" type="string">
+      ISO 8601 UTC timestamp of the most recent registry update (start, stop, or
+      re-provision).
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="count" type="integer" required>
+  Total number of instances returned. Equals `instances.length`.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+```bash cURL
+curl -s https://api.example.com/api/admin/instances \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+```json Response 200
+{
+  "instances": [
+    {
+      "tenant_id": "acme-corp",
+      "stack_name": "erp-agent-services-acme-corp",
+      "rds_identifier": "erp-rds-acme-corp",
+      "alb_dns": "erp-agent-acme-corp-1234567890.us-east-1.elb.amazonaws.com",
+      "admin_email": "admin@acme.com",
+      "status": "on",
+      "live_status": "on",
+      "running_count": 1,
+      "desired_count": 1,
+      "rds_status": "available",
+      "created_at": "2024-11-15T14:32:00Z",
+      "updated_at": "2024-12-01T09:00:00Z"
+    },
+    {
+      "tenant_id": "beta-client",
+      "stack_name": "erp-agent-services-beta-client",
+      "rds_identifier": "erp-rds-beta-client",
+      "alb_dns": "",
+      "admin_email": "",
+      "status": "off",
+      "live_status": "off",
+      "running_count": 0,
+      "desired_count": 0,
+      "rds_status": "stopped",
+      "created_at": "2025-01-08T10:15:00Z",
+      "updated_at": "2025-01-08T10:15:00Z"
+    }
+  ],
+  "count": 2
+}
+```
+</CodeGroup>
+
+---
+
+## POST /api/admin/instances
+
+Provision a new tenant instance by dispatching the `provision-tenant.yml`
+GitHub Actions workflow. Returns `202 Accepted` immediately — provisioning
+runs asynchronously and takes approximately 15 minutes.
+
+<Warning>
+  **The backend never provisions infrastructure directly.** Creating a tenant
+  requires CloudFormation and IAM privileges that the application must not
+  hold. Instead, this endpoint dispatches the GitHub Actions workflow
+  (`.github/workflows/provision-tenant.yml`) using a fine-grained PAT stored
+  in AWS Secrets Manager. The workflow runs with an OIDC role that has the
+  necessary CloudFormation/IAM access.
+</Warning>
+
+The workflow is **idempotent** — it is safe to re-run if something failed
+mid-way. Each `tenant_id` runs in its own concurrency group
+(`provision-tenant-<tenant_id>`), so parallel dispatches for the same slug
+are serialised, never run concurrently.
+
+### GitHub token prerequisite
+
+The endpoint reads the GitHub fine-grained PAT from the AWS Secrets Manager
+secret named by the `GITHUB_TOKEN_SECRET_NAME` environment variable. The PAT
+must have **Actions: write** permission on the repository that hosts the
+workflow.
+
+If the secret is absent or inaccessible, the endpoint returns `503` with an
+actionable error message that includes the expected secret name.
+
+### Request body
+
+<ParamField body="tenant_id" type="string" required>
+  Unique slug for the new tenant. Must match `^[a-z0-9][a-z0-9-]{1,30}$`
+  (lowercase letters, digits, and hyphens; 2–31 characters total). The slugs
+  `production` and `staging` are reserved and will be rejected with `400`.
+</ParamField>
+
+<ParamField body="admin_email" type="string" default='""'>
+  Email address for the initial `org_admin` Cognito user. When provided, the
+  provisioning script creates the user and stores the temporary password in
+  Secrets Manager under `erp-agent/tenant-admin-temp-<tenant_id>` (expires
+  after 7 days without login). Leave empty to skip admin user creation.
+</ParamField>
+
+<ParamField body="rds_class" type="string" default='"db.t3.medium"'>
+  RDS DB instance class. Accepted values: `db.t3.medium`, `db.t3.small`,
+  `db.t4g.medium`. This controls the cost of the tenant (~$80/month on,
+  ~$37/month off for the default class).
+</ParamField>
+
+### Response
+
+Returns **202 Accepted** on success.
+
+<ResponseField name="tenant_id" type="string" required>
+  The slug of the tenant being provisioned — mirrors the request body value.
+</ResponseField>
+
+<ResponseField name="action" type="string" required>
+  Always `"provision_dispatched"` for this endpoint.
+</ResponseField>
+
+<ResponseField name="detail" type="string">
+  Human-readable status message. Indicates the expected provisioning duration
+  and where to follow progress.
+</ResponseField>
+
+<ResponseField name="actions_url" type="string">
+  Direct URL to the GitHub Actions workflow runs page for
+  `provision-tenant.yml`. Use this to monitor live provisioning progress.
+</ResponseField>
+
+### Error responses
+
+| Status | Condition |
+|---|---|
+| `400` | `tenant_id` fails the slug validation regex or is a reserved word (`production`, `staging`). |
+| `409` | A tenant with this `tenant_id` already exists in the DynamoDB registry. |
+| `503` | The GitHub PAT secret (`GITHUB_TOKEN_SECRET_NAME`) is missing or inaccessible in Secrets Manager. |
+| `502` | GitHub API returned an unexpected status code (not `204`). |
+
+### Example
+
+<CodeGroup>
+```bash cURL
+curl -s -X POST https://api.example.com/api/admin/instances \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "acme-corp",
+    "admin_email": "admin@acme.com",
+    "rds_class": "db.t3.medium"
+  }'
+```
+
+```json Response 202
+{
+  "tenant_id": "acme-corp",
+  "action": "provision_dispatched",
+  "detail": "Provisioning lanzado (~15 min). Seguir el progreso en GitHub Actions.",
+  "actions_url": "https://github.com/your-org/your-repo/actions/workflows/provision-tenant.yml"
+}
+```
+
+```json Response 409
+{
+  "detail": "El tenant ya existe: acme-corp"
+}
+```
+
+```json Response 503
+{
+  "detail": "Falta el token de GitHub para disparar el provisioning. Crear un fine-grained PAT con permiso Actions:write sobre el repo y guardarlo en Secrets Manager como 'github-pat-provision-tenant'."
+}
+```
+</CodeGroup>
+
+---
+
+## POST /api/admin/instances/{tenant_id}/start
+
+Turn a registered tenant instance **on** by setting ECS `desiredCount` to `1`
+and starting the RDS DB instance. Updates the registry `status` to `"on"`.
+The instance takes approximately 3–5 minutes to become fully available after
+this call returns.
+
+### Path parameters
+
+<ParamField path="tenant_id" type="string" required>
+  Slug of the tenant to start. Must pass the same `^[a-z0-9][a-z0-9-]{1,30}$`
+  validation as the create endpoint.
+</ParamField>
+
+### Response
+
+<ResponseField name="tenant_id" type="string" required>
+  Slug of the tenant that was acted on.
+</ResponseField>
+
+<ResponseField name="action" type="string" required>
+  Always `"start"` for this endpoint.
+</ResponseField>
+
+<ResponseField name="detail" type="string">
+  Human-readable confirmation message.
+</ResponseField>
+
+<ResponseField name="actions_url" type="string">
+  Empty string for start/stop actions (only populated by the provision endpoint).
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+```bash cURL
+curl -s -X POST https://api.example.com/api/admin/instances/acme-corp/start \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+```json Response 200
+{
+  "tenant_id": "acme-corp",
+  "action": "start",
+  "detail": "Encendiendo — la instancia tarda ~3-5 min en quedar disponible",
+  "actions_url": ""
+}
+```
+</CodeGroup>
+
+---
+
+## POST /api/admin/instances/{tenant_id}/stop
+
+Turn a registered tenant instance **off** by setting ECS `desiredCount` to
+`0` and stopping the RDS DB instance. Updates the registry `status` to
+`"off"`. The tenant URL will respond with `503` until the instance is
+started again.
+
+### Path parameters
+
+<ParamField path="tenant_id" type="string" required>
+  Slug of the tenant to stop.
+</ParamField>
+
+### Response
+
+<ResponseField name="tenant_id" type="string" required>
+  Slug of the tenant that was acted on.
+</ResponseField>
+
+<ResponseField name="action" type="string" required>
+  Always `"stop"` for this endpoint.
+</ResponseField>
+
+<ResponseField name="detail" type="string">
+  Human-readable confirmation message.
+</ResponseField>
+
+<ResponseField name="actions_url" type="string">
+  Empty string for start/stop actions.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+```bash cURL
+curl -s -X POST https://api.example.com/api/admin/instances/acme-corp/stop \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+```json Response 200
+{
+  "tenant_id": "acme-corp",
+  "action": "stop",
+  "detail": "Apagada — la URL respondera 503 hasta volver a encenderla",
+  "actions_url": ""
+}
+```
+</CodeGroup>
+
+---
+
+## Provisioning lifecycle
+
+The diagram below shows the complete lifecycle of a tenant instance from
+initial dispatch through normal operation:
+
+```
+POST /api/admin/instances
+        │
+        ▼
+GitHub Actions workflow dispatched
+(provision-tenant.yml, ~15 min)
+        │
+        ├── Validate tenant_id slug
+        ├── Configure AWS credentials (OIDC)
+        ├── Create RDS instance + secret (erp-agent/tenant-admin-temp-<id>)
+        ├── Deploy CloudFormation stack (erp-agent-services-<id>)  ← desiredCount=0
+        ├── Create Cognito org_admin user (if admin_email provided)
+        └── Register entry in DynamoDB erp-agent-tenants
+                │
+                ▼
+        Instance registered — status: "off", live_status: "off"
+                │
+                ▼
+POST /api/admin/instances/{tenant_id}/start
+        │
+        ├── ECS desiredCount → 1
+        ├── RDS start_db_instance
+        └── Registry status → "on"
+                │
+                ▼
+        live_status: "starting" → "on"  (~3–5 min)
+```
+
+## DynamoDB tenant registry
+
+The `erp-agent-tenants` table is scanned by `GET /api/admin/instances` and
+keyed on `tenant_id` (string). The table holds the same fields surfaced by
+`TenantInstanceSummary`: `stack_name`, `rds_identifier`, `alb_dns`,
+`admin_email`, `status`, `created_at`, and `updated_at`. Live ECS/RDS state
+fields (`live_status`, `running_count`, `desired_count`, `rds_status`) are
+not stored — they are fetched from AWS on every list call and overlaid
+in-memory.
+
+<Note>
+  If the `erp-agent-tenants` table does not yet exist (e.g. before the first
+  tenant is provisioned), `GET /api/admin/instances` returns an empty list
+  rather than an error.
+</Note>

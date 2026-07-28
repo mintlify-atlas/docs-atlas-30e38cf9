@@ -1,0 +1,570 @@
+---
+title: "WebSocket API — Real-Time Streaming Chat via /ws/chat"
+sidebarTitle: "WebSocket API"
+description: "Stream per-node pipeline progress and full chat responses in real time over a persistent WebSocket connection with JWT authentication."
+---
+
+The WebSocket endpoint at `/ws/chat` gives clients a live window into the LangGraph pipeline. Instead of waiting for the full pipeline to finish, the server emits a `node_start` / `node_end` event for each processing stage — understanding, planning, execution, presentation — and then delivers a final `response` event with the complete result payload. This makes it possible to render meaningful progress indicators while the agent works.
+
+<Note>
+  Use **`wss://`** (TLS) in all production environments. Plain `ws://` is only appropriate for local development.
+</Note>
+
+---
+
+## Connection URL
+
+| Environment | URL |
+|-------------|-----|
+| Local development | `ws://localhost:8000/ws/chat` |
+| Production | `wss://api.example.com/ws/chat` |
+
+No query parameters or subprotocols are required for the initial HTTP upgrade.
+
+---
+
+## Authentication Handshake
+
+WebSocket connections cannot carry an `Authorization` HTTP header after the initial upgrade in most browser environments, so authentication is performed as the **first message** on the socket.
+
+The server enforces a **10-second timeout** (`AUTH_TIMEOUT_SECONDS = 10`). If the auth message is not received within that window the server sends an `error` event with `error_code: "AUTH_TIMEOUT"` and closes the connection.
+
+<Steps>
+  <Step title="Connect">
+    Open the WebSocket connection to `wss://api.example.com/ws/chat`.
+  </Step>
+  <Step title="Send the auth message">
+    Immediately send a JSON message with `type: "auth"` and your Cognito JWT:
+
+    ```json
+    {
+      "type": "auth",
+      "token": "<cognito_id_token>"
+    }
+    ```
+  </Step>
+  <Step title="Receive auth_success or error">
+    On success the server responds with:
+
+    ```json
+    {
+      "type": "auth_success",
+      "user_id": "a1b2c3d4-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    }
+    ```
+
+    On failure the server sends an `error` event (see [Error Events](#error-events)) and closes the connection.
+  </Step>
+  <Step title="Start chatting">
+    Send `chat` or `feedback` messages. The server remains connected and processes multiple turns in the same session.
+  </Step>
+</Steps>
+
+<Warning>
+  If the first message is not `{"type": "auth", ...}` the server immediately sends `AUTH_REQUIRED` and closes the connection. Always send the auth message before any `chat` message.
+</Warning>
+
+---
+
+## Client → Server Messages
+
+### chat
+
+Send a natural language question to the agent pipeline.
+
+<ParamField body="type" type="string" required>
+  Must be `"chat"`.
+</ParamField>
+
+<ParamField body="message" type="string" required>
+  The natural language question (same constraints as the REST API: 1–2 000 characters).
+</ParamField>
+
+<ParamField body="session_id" type="string">
+  Session identifier for multi-turn history. Omit or pass an empty string to generate a new UUID session for this turn. The active `session_id` is echoed back in every `response` event.
+</ParamField>
+
+<ParamField body="confirmed" type="boolean | null">
+  HITL confirmation flag. Set to `true` when re-sending a message after receiving a `confirmation_required` event. Defaults to `false`.
+</ParamField>
+
+<ParamField body="file_id" type="string">
+  Optional ID of a previously uploaded file (from `POST /upload`). When provided the pipeline routes the turn through the `analyze_file` node.
+</ParamField>
+
+```json
+{
+  "type": "chat",
+  "message": "¿Cuáles son los costos de producción por centro de costos?",
+  "session_id": "session-abc123",
+  "confirmed": null
+}
+```
+
+### feedback
+
+Submit thumbs-up / thumbs-down feedback on a completed query result. Feedback is persisted to DynamoDB for query quality tracking.
+
+<ParamField body="type" type="string" required>
+  Must be `"feedback"`.
+</ParamField>
+
+<ParamField body="query_id" type="string" required>
+  The `query_log_id` value from the `response` event you are rating.
+</ParamField>
+
+<ParamField body="timestamp" type="string" required>
+  The `query_timestamp` value from the same `response` event. Used as the DynamoDB sort key.
+</ParamField>
+
+<ParamField body="feedback" type="string" required>
+  `"up"` for a positive rating, `"down"` for a negative rating.
+</ParamField>
+
+```json
+{
+  "type": "feedback",
+  "query_id": "qlog-7f3a....",
+  "timestamp": "2024-03-15T10:30:00.000000+00:00",
+  "feedback": "up"
+}
+```
+
+The server acknowledges with:
+
+```json
+{
+  "type": "feedback_received",
+  "query_id": "qlog-7f3a...."
+}
+```
+
+---
+
+## Server → Client Events
+
+The server sends a stream of typed JSON objects during each pipeline run. Events arrive in this sequence:
+
+```
+node_start (understand) → node_end (understand) →
+node_start (plan) → node_end (plan) →
+... → node_start (present) → node_end (present) →
+response  ─ or ─  confirmation_required  ─ or ─  error
+```
+
+### node_start
+
+Emitted when the pipeline enters a processing node. Use this to drive progress indicators in your UI.
+
+<ResponseField name="type" type="string">
+  Always `"node_start"`.
+</ResponseField>
+
+<ResponseField name="node" type="string">
+  Internal node identifier. See [Node Labels](#pipeline-node-labels) below.
+</ResponseField>
+
+<ResponseField name="label" type="string">
+  Human-readable Spanish label suitable for display in a loading state.
+</ResponseField>
+
+<ResponseField name="timestamp" type="string">
+  ISO 8601 UTC timestamp of when the node started.
+</ResponseField>
+
+```json
+{
+  "type": "node_start",
+  "node": "understand",
+  "label": "Analizando tu consulta",
+  "timestamp": "2024-03-15T10:30:00.123456+00:00"
+}
+```
+
+### node_end
+
+Emitted when a node completes successfully.
+
+<ResponseField name="type" type="string">
+  Always `"node_end"`.
+</ResponseField>
+
+<ResponseField name="node" type="string">
+  Internal node identifier matching the preceding `node_start`.
+</ResponseField>
+
+<ResponseField name="timestamp" type="string">
+  ISO 8601 UTC timestamp of when the node finished.
+</ResponseField>
+
+```json
+{
+  "type": "node_end",
+  "node": "understand",
+  "timestamp": "2024-03-15T10:30:00.891234+00:00"
+}
+```
+
+### response
+
+The final event of a successful pipeline run. Contains the complete structured response.
+
+<ResponseField name="type" type="string">
+  Always `"response"`.
+</ResponseField>
+
+<ResponseField name="data" type="object">
+  <Expandable title="Response data fields">
+    <ResponseField name="response" type="string">
+      Narrative answer text (plain text or Markdown).
+    </ResponseField>
+    <ResponseField name="sql" type="string | null">
+      Generated and executed SQL query.
+    </ResponseField>
+    <ResponseField name="row_count" type="integer | null">
+      Number of rows returned by the query.
+    </ResponseField>
+    <ResponseField name="session_id" type="string">
+      Active session ID for the next turn.
+    </ResponseField>
+    <ResponseField name="display_mode" type="string">
+      Rendering hint for the frontend. One of: `text_only`, `table_primary`, `chart_primary`, `chart_only`.
+    </ResponseField>
+    <ResponseField name="chart_config" type="object | null">
+      Full Apache ECharts `option` object. Present when `display_mode` is `chart_primary` or `chart_only`.
+    </ResponseField>
+    <ResponseField name="chart_type" type="string | null">
+      Chart type string (e.g. `"bar"`, `"line"`, `"pie"`).
+    </ResponseField>
+    <ResponseField name="query_results" type="array | null">
+      Raw result rows as an array of objects. Present for table and chart display modes.
+    </ResponseField>
+    <ResponseField name="column_names" type="array | null">
+      Ordered list of column names for the result set.
+    </ResponseField>
+    <ResponseField name="kpis" type="object | null">
+      KPI values object. Present for non-text-only display modes.
+    </ResponseField>
+    <ResponseField name="executive_summary" type="string | null">
+      Markdown executive summary. Present for analysis display mode.
+    </ResponseField>
+    <ResponseField name="exports" type="object | null">
+      Export download payloads `{csv, xlsx}`. Present for analysis display mode.
+    </ResponseField>
+    <ResponseField name="suggestions" type="array">
+      Array of follow-up question strings the agent recommends.
+    </ResponseField>
+    <ResponseField name="assumptions" type="array">
+      Array of assumption strings the agent made when interpreting the query.
+    </ResponseField>
+    <ResponseField name="query_log_id" type="string | null">
+      ID for the DynamoDB query log entry. Pass this to the `feedback` message to rate the result.
+    </ResponseField>
+    <ResponseField name="query_timestamp" type="string | null">
+      ISO 8601 timestamp for the DynamoDB query log entry. Required alongside `query_log_id` for feedback.
+    </ResponseField>
+    <ResponseField name="figures" type="array | null">
+      Base64-encoded figure images from file analysis (PNG). Present only for `file_analysis` turns.
+    </ResponseField>
+    <ResponseField name="code_output" type="string | null">
+      Stdout from Python code execution during file analysis.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+```json
+{
+  "type": "response",
+  "data": {
+    "response": "Los costos de producción por centro de costos en Q1 2024 fueron...",
+    "sql": "SELECT cebe, SUM(importe) AS total FROM t_costos WHERE periodo = '2024-Q1' GROUP BY cebe",
+    "row_count": 12,
+    "session_id": "session-abc123",
+    "display_mode": "chart_primary",
+    "chart_type": "bar",
+    "kpis": { "total": 4820000, "average": 401667 },
+    "suggestions": ["¿Cómo se compara con Q2?", "¿Qué centro de costos tuvo más variación?"],
+    "query_log_id": "qlog-7f3a1234",
+    "query_timestamp": "2024-03-15T10:30:02.000000+00:00"
+  }
+}
+```
+
+### confirmation_required
+
+Emitted when the HITL gate is triggered. No SQL has been executed. Prompt the user to confirm, then resend the original `chat` message with `confirmed: true`.
+
+<ResponseField name="type" type="string">
+  Always `"confirmation_required"`.
+</ResponseField>
+
+<ResponseField name="message" type="string">
+  Human-readable explanation of why confirmation is needed.
+</ResponseField>
+
+<ResponseField name="session_id" type="string">
+  The active session ID. Include this when resending the confirmed request.
+</ResponseField>
+
+```json
+{
+  "type": "confirmation_required",
+  "message": "Esta consulta escaneará más de 2 millones de registros. ¿Deseas continuar?",
+  "session_id": "session-abc123"
+}
+```
+
+### Error Events
+
+<ResponseField name="type" type="string">
+  Always `"error"`.
+</ResponseField>
+
+<ResponseField name="error_code" type="string">
+  Machine-readable error code. See table below.
+</ResponseField>
+
+<ResponseField name="message" type="string">
+  Human-readable error description.
+</ResponseField>
+
+| `error_code` | Cause | Connection closed? |
+|---|---|---|
+| `AUTH_TIMEOUT` | No auth message received within 10 seconds | Yes |
+| `AUTH_REQUIRED` | First message was not `{"type": "auth", ...}` | Yes |
+| `AUTH_INVALID_TOKEN` | JWT is invalid, expired, or signature verification failed | Yes |
+| `TENANT_MISMATCH` | User's tenant does not match the expected instance tenant | Yes |
+| `GRAPH_ERROR` | Unhandled error in the LangGraph pipeline | No — connection stays open |
+| `INTERNAL_ERROR` | Unexpected server error in the WebSocket handler | No |
+
+---
+
+## Pipeline Node Labels
+
+These are all nodes that emit `node_start` / `node_end` events, sourced directly from `_NODE_LABELS` in `src/api/websocket.py`:
+
+| `node` | `label` (displayed to user) | Description |
+|--------|------|-------------|
+| `understand` | Analizando tu consulta | Intent classification and slot extraction |
+| `clarify` | Verificando información | Asking clarifying questions for missing parameters |
+| `plan` | Preparando consulta SQL | Schema linking and SQL generation |
+| `execute` | Ejecutando consulta | Running the validated SQL query against the database |
+| `present` | Preparando respuesta | Building charts, KPIs, and narrative response |
+| `analyze_file` | Analizando archivo | Processing an uploaded Excel/CSV file |
+| `viz_change` | Cambiando visualización | Updating chart type based on user request |
+| `discuss_data` | Analizando los datos | Follow-up analysis on previously retrieved data |
+| `general_respond` | Generando respuesta | Handling general conversational turns |
+
+---
+
+## JSON Serialization Notes
+
+The server applies recursive sanitisation before sending any `response` event. This is important when consuming data in typed languages:
+
+| Python type | Serialised as |
+|---|---|
+| `Decimal` (whole) | `integer` — `Decimal("42")` → `42` |
+| `Decimal` (fractional) | `float` — `Decimal("3.14")` → `3.14` |
+| `datetime` | ISO 8601 string — `"2024-03-15T10:30:00+00:00"` |
+| `date` | ISO 8601 date string — `"2024-03-15"` |
+| `time` | ISO 8601 time string — `"10:30:00"` |
+
+This sanitisation exists because SAP/ERP database columns frequently return `Decimal` and `datetime` types that are not natively JSON-serialisable.
+
+---
+
+## Code Examples
+
+<Tabs>
+  <Tab title="JavaScript">
+
+```javascript
+// Full auth + multi-turn chat flow
+const WS_URL = "wss://api.example.com/ws/chat";
+const TOKEN  = "eyJraWQ..."; // JWT from AWS Cognito / Amplify
+
+function createChatSocket() {
+  const ws = new WebSocket(WS_URL);
+
+  ws.addEventListener("open", () => {
+    console.log("Connected — sending auth");
+    ws.send(JSON.stringify({ type: "auth", token: TOKEN }));
+  });
+
+  ws.addEventListener("message", (event) => {
+    const msg = JSON.parse(event.data);
+
+    switch (msg.type) {
+      case "auth_success":
+        console.log("Authenticated as", msg.user_id);
+        // Now safe to send chat messages
+        sendChat(ws, "¿Cuánto vendimos por región en Q1?", "session-001");
+        break;
+
+      case "node_start":
+        // Update your loading indicator
+        console.log(`⏳ ${msg.label}`);
+        updateProgressUI(msg.node, msg.label);
+        break;
+
+      case "node_end":
+        console.log(`✅ Node done: ${msg.node}`);
+        break;
+
+      case "response":
+        console.log("Final response:", msg.data.response);
+        renderResponse(msg.data);
+        break;
+
+      case "confirmation_required":
+        console.log("HITL:", msg.message);
+        if (confirm(msg.message)) {
+          // Resend the original message with confirmed = true
+          sendChat(ws, currentMessage, msg.session_id, true);
+        }
+        break;
+
+      case "feedback_received":
+        console.log("Feedback recorded for", msg.query_id);
+        break;
+
+      case "error":
+        console.error(`[${msg.error_code}] ${msg.message}`);
+        if (["AUTH_TIMEOUT", "AUTH_REQUIRED", "AUTH_INVALID_TOKEN", "TENANT_MISMATCH"].includes(msg.error_code)) {
+          ws.close();
+        }
+        break;
+    }
+  });
+
+  ws.addEventListener("close", (event) => {
+    console.log("Disconnected", event.code, event.reason);
+  });
+
+  return ws;
+}
+
+function sendChat(ws, message, sessionId, confirmed = false) {
+  ws.send(JSON.stringify({
+    type: "chat",
+    message,
+    session_id: sessionId,
+    confirmed,
+  }));
+}
+
+function sendFeedback(ws, queryLogId, queryTimestamp, rating) {
+  ws.send(JSON.stringify({
+    type: "feedback",
+    query_id: queryLogId,
+    timestamp: queryTimestamp,
+    feedback: rating, // "up" or "down"
+  }));
+}
+
+function updateProgressUI(node, label) {
+  const el = document.getElementById("progress-label");
+  if (el) el.textContent = label;
+}
+
+function renderResponse(data) {
+  // data.display_mode drives what to render
+  // data.response  → narrative text
+  // data.chart_config → pass to echarts.setOption()
+  // data.query_results + data.column_names → render table
+  // data.kpis → render KPI cards
+}
+
+// Start the connection
+const socket = createChatSocket();
+```
+
+  </Tab>
+  <Tab title="Python (websockets)">
+
+```python
+import asyncio
+import json
+import websockets
+
+WS_URL = "wss://api.example.com/ws/chat"
+TOKEN  = "eyJraWQ..."  # JWT from AWS Cognito
+
+async def chat_session():
+    async with websockets.connect(WS_URL) as ws:
+        # Step 1: Authenticate
+        await ws.send(json.dumps({"type": "auth", "token": TOKEN}))
+        auth_response = json.loads(await ws.recv())
+
+        if auth_response["type"] != "auth_success":
+            raise RuntimeError(f"Auth failed: {auth_response}")
+
+        user_id = auth_response["user_id"]
+        print(f"Authenticated as {user_id}")
+
+        session_id = "session-py-001"
+        message    = "¿Cuáles son los ingresos por línea de producto en el año?"
+
+        # Step 2: Send chat message
+        await ws.send(json.dumps({
+            "type": "chat",
+            "message": message,
+            "session_id": session_id,
+            "confirmed": False,
+        }))
+
+        # Step 3: Process the event stream
+        final_data = None
+        async for raw in ws:
+            event = json.loads(raw)
+            event_type = event.get("type")
+
+            if event_type == "node_start":
+                print(f"  ⏳  {event['label']}")
+
+            elif event_type == "node_end":
+                print(f"  ✅  {event['node']} done")
+
+            elif event_type == "confirmation_required":
+                print(f"\n  HITL: {event['message']}")
+                answer = input("  Confirm? (y/n): ").strip().lower()
+                if answer == "y":
+                    await ws.send(json.dumps({
+                        "type": "chat",
+                        "message": message,
+                        "session_id": event["session_id"],
+                        "confirmed": True,
+                    }))
+                else:
+                    print("  Cancelled.")
+                    break
+
+            elif event_type == "response":
+                final_data = event["data"]
+                print(f"\n{final_data['response']}")
+                if final_data.get("sql"):
+                    print(f"\nSQL: {final_data['sql']}")
+                if final_data.get("kpis"):
+                    print(f"KPIs: {final_data['kpis']}")
+                break  # Exit after first response; loop for multi-turn
+
+            elif event_type == "error":
+                print(f"  Error [{event['error_code']}]: {event['message']}")
+                break
+
+        # Step 4: Submit feedback (optional)
+        if final_data and final_data.get("query_log_id"):
+            await ws.send(json.dumps({
+                "type": "feedback",
+                "query_id": final_data["query_log_id"],
+                "timestamp": final_data["query_timestamp"],
+                "feedback": "up",
+            }))
+            ack = json.loads(await ws.recv())
+            print(f"Feedback acknowledged: {ack}")
+
+asyncio.run(chat_session())
+```
+
+  </Tab>
+</Tabs>

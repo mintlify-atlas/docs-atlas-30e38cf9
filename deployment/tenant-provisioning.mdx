@@ -1,0 +1,235 @@
+---
+title: "Multi-Tenant Provisioning and Management"
+sidebarTitle: "Tenant Provisioning"
+description: "Provision isolated ERP Agent tenants with dedicated RDS, ECS service, and Cognito group using GitHub Actions workflow_dispatch or the admin panel API."
+---
+
+The ERP Financial Agent is designed as a multi-tenant SaaS product. Each client (tenant) gets a fully isolated deployment: a dedicated MySQL RDS instance, a dedicated ECS service running inside its own CloudFormation stack, and a Cognito user group scoped to that tenant. The primary instance — identified by `EXPECTED_TENANT=*` — serves internal users and hosts the admin panel. Tenant instances have `EXPECTED_TENANT` set to the tenant's slug, so only users with a matching `custom:tenantId` Cognito attribute can connect.
+
+## Primary instance vs. tenant instances
+
+| Attribute | Primary instance | Tenant instance |
+|-----------|-----------------|-----------------|
+| CloudFormation stack | `erp-agent-services` | `erp-agent-services-{slug}` |
+| `EXPECTED_TENANT` | `*` | e.g. `mexicana` |
+| ECS cluster | `erp-agent-cluster-production` | `erp-agent-cluster-{slug}` |
+| ECS service | `erp-agent-service-production` | `erp-agent-service-{slug}` |
+| RDS instance | `iafinagent` (shared) | `erp-rds-{slug}` (dedicated) |
+| DynamoDB tables | Created by primary stack | Shared (reused from primary) |
+| ECR repositories | Created by primary stack | Shared (reused from primary) |
+| S3 exports bucket | Created by primary stack | Shared (reused from primary) |
+| Admin panel access | Yes (`IsPrimaryInstance`) | No |
+| Initial desired count | 2 | 0 (off) |
+| Estimated cost (on) | ~$80/mo | ~$80/mo |
+| Estimated cost (off) | — | ~$37/mo (ALB + Redis + RDS storage) |
+
+The primary instance can call `ecs:UpdateService` and `rds:StartDBInstance`/`rds:StopDBInstance` on tenant resources to turn them on and off from the admin panel. Tenant instances never have permission to operate other tenants.
+
+## Provisioning a new tenant
+
+There are two equivalent ways to provision a tenant: via GitHub Actions `workflow_dispatch` (the standard path) or by calling the admin panel API (which triggers the same workflow programmatically).
+
+### Option A — GitHub Actions workflow dispatch
+
+<Steps>
+  <Step title="Navigate to the Provision Tenant workflow">
+    In your GitHub repository, go to **Actions → Provision Tenant** and click **Run workflow**.
+  </Step>
+
+  <Step title="Fill in the inputs">
+    | Input | Description | Example |
+    |-------|-------------|---------|
+    | `tenant_id` | Lowercase slug: `[a-z0-9][a-z0-9-]{1,30}` | `mexicana` |
+    | `admin_email` | Initial `org_admin` user (optional) | `admin@mexicana.com` |
+    | `rds_class` | RDS instance class | `db.t3.medium` (default) |
+
+    <Warning>
+      `production` and `staging` are reserved slugs and will be rejected. The slug must be lowercase alphanumeric with hyphens only, 2–31 characters.
+    </Warning>
+  </Step>
+
+  <Step title="Monitor the workflow run">
+    The workflow has a 40-minute timeout (RDS creation takes 5–10 minutes). A summary table is posted to the run page when provisioning completes.
+  </Step>
+</Steps>
+
+### Option B — Admin panel API
+
+From the primary instance, send a `POST /api/instances` request. The backend reads the `erp-agent/github-workflow-token` secret from Secrets Manager and triggers the `provision-tenant.yml` GitHub Actions workflow via the GitHub API:
+
+```bash
+curl -X POST https://<primary-alb>/api/instances \
+  -H "Authorization: Bearer <cognito-token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "mexicana",
+    "admin_email": "admin@mexicana.com",
+    "rds_class": "db.t3.medium"
+  }'
+```
+
+## What `provision-new-tenant.sh` does
+
+The script runs seven idempotent steps — safe to re-run if a previous attempt failed partway through.
+
+<Steps>
+  <Step title="Step 1 — DB password in Secrets Manager">
+    Generates a 32-character random password and stores it as `erp-agent/db-password-{slug}`. If the secret already exists, it reuses the existing value. The password is **never** printed to stdout or stored in CloudWatch Logs.
+  </Step>
+
+  <Step title="Step 2 — Dedicated RDS instance">
+    Creates `erp-rds-{slug}` (MySQL 8.0, `db.t3.medium`, 20 GB gp3, 7-day backups, encrypted, not publicly accessible). Network configuration (subnet group and VPC security group) is inherited from the production RDS instance `iafinagent` rather than using hardcoded names, because the real subnet group is named `default-vpc-*` and the security group is `vpc_mysql_iafinagent`.
+
+    The script waits for `db-instance-available` before continuing.
+  </Step>
+
+  <Step title="Step 3 — Collect shared resources from primary stack">
+    Reads `BackendECRUri`, `FrontendECRUri`, and `ExportsBucketName` from the `erp-agent-services` CloudFormation stack outputs. Tenant stacks reuse these resources instead of creating duplicates.
+  </Step>
+
+  <Step title="Step 4 — Deploy CloudFormation stack">
+    Deploys `erp-agent-services-{slug}` using `services.yaml` with these key parameter overrides:
+
+    ```bash
+    EnvironmentName={slug}
+    NetworkEnvironmentName=production      # shares the primary VPC
+    ExpectedTenant={slug}                  # restricts login to this tenant
+    RbacEnforce=false                      # shadow-log mode initially
+    DesiredCount=0                         # starts OFF
+    ReuseDynamoDBSharedTables=true         # shares conversations/query-log tables
+    ExistingBackendECRRepoUri=<primary>    # shares ECR repositories
+    ExistingFrontendECRRepoUri=<primary>
+    ExistingExportsBucketArn=<primary>
+    ExistingBackendLogGroupName=/ecs/erp-agent/backend
+    ExistingFrontendLogGroupName=/ecs/erp-agent/frontend
+    ```
+  </Step>
+
+  <Step title="Step 5 — Create Cognito admin user (optional)">
+    If `admin_email` is provided, creates a Cognito user with:
+    - `email_verified: true`
+    - `custom:tenantId: {slug}`
+    - `custom:company: {slug}`
+    - `name: Admin {slug}`
+
+    The user is added to the `org_admin` Cognito group. A temporary password is generated and stored in Secrets Manager as `erp-agent/tenant-admin-temp-{slug}`. To retrieve it:
+
+    ```bash
+    aws secretsmanager get-secret-value \
+      --secret-id erp-agent/tenant-admin-temp-{slug} \
+      --query SecretString \
+      --output text
+    ```
+
+    The temporary password expires after 7 days without a login.
+  </Step>
+
+  <Step title="Step 6 — Generate up/down scripts">
+    Creates `scripts/{slug}-up.sh` and `scripts/{slug}-down.sh` in the repository. These scripts call `aws ecs update-service` and `aws rds start-db-instance` / `aws rds stop-db-instance` respectively, and update the `erp-agent-tenants` DynamoDB table.
+  </Step>
+
+  <Step title="Step 7 — Register in DynamoDB tenant registry">
+    Creates the `erp-agent-tenants` table if it does not yet exist (partition key `tenant_id`, on-demand billing), then writes an item with `status = "off"`, the ALB DNS, RDS identifier, and stack name. The deploy pipeline reads this table to refresh active tenants after every production push.
+  </Step>
+</Steps>
+
+## DynamoDB tenant registry
+
+The `erp-agent-tenants` table is the authoritative registry of all provisioned tenants. The admin panel and the post-deploy refresh job read from it.
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `tenant_id` | String (PK) | Tenant slug, e.g. `mexicana` |
+| `stack_name` | String | `erp-agent-services-mexicana` |
+| `rds_identifier` | String | `erp-rds-mexicana` |
+| `alb_dns` | String | ALB hostname when the stack is on |
+| `admin_email` | String | Initial `org_admin` email |
+| `status` | String | `on` or `off` |
+| `created_at` | String | ISO 8601 timestamp |
+| `updated_at` | String | ISO 8601 timestamp |
+
+## Starting and stopping a tenant
+
+<Tabs>
+  <Tab title="CLI scripts">
+    ```bash
+    # Turn on (sets ECS desiredCount=1 and starts RDS)
+    ./scripts/mexicana-up.sh
+
+    # Turn off (sets ECS desiredCount=0 and stops RDS)
+    ./scripts/mexicana-down.sh
+    ```
+  </Tab>
+
+  <Tab title="AWS CLI">
+    ```bash
+    # Start ECS service
+    aws ecs update-service \
+      --cluster erp-agent-cluster-mexicana \
+      --service erp-agent-service-mexicana \
+      --desired-count 1 \
+      --region us-east-1
+
+    # Start RDS
+    aws rds start-db-instance \
+      --db-instance-identifier erp-rds-mexicana \
+      --region us-east-1
+    ```
+  </Tab>
+
+  <Tab title="Admin panel API">
+    ```bash
+    # Turn on
+    curl -X POST https://<primary-alb>/api/instances/mexicana/start \
+      -H "Authorization: Bearer <cognito-token>"
+
+    # Turn off
+    curl -X POST https://<primary-alb>/api/instances/mexicana/stop \
+      -H "Authorization: Bearer <cognito-token>"
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  After starting a tenant, allow 3–5 minutes for the ECS task to become healthy and the ALB health check to pass before sending user traffic.
+</Note>
+
+## Post-provisioning: user management
+
+After provisioning, grant additional users access to the tenant through the admin panel or API.
+
+**Create a Cognito user with tenant assignment:**
+
+```bash
+aws cognito-idp admin-create-user \
+  --user-pool-id us-east-1_2qpNBGCmb \
+  --username user@example.com \
+  --user-attributes \
+    "Name=email,Value=user@example.com" \
+    "Name=email_verified,Value=true" \
+    "Name=custom:tenantId,Value=mexicana" \
+  --region us-east-1
+```
+
+**Grant cross-instance access** (allow a user to connect to multiple tenant instances):
+
+```bash
+POST /api/admin/users/{username}/instances
+Content-Type: application/json
+
+{ "instance_slug": "mexicana" }
+```
+
+**Add a user to the `org_admin` Cognito group:**
+
+```bash
+aws cognito-idp admin-add-user-to-group \
+  --user-pool-id us-east-1_2qpNBGCmb \
+  --username user@example.com \
+  --group-name org_admin \
+  --region us-east-1
+```
+
+<Warning>
+  Each new tenant's RDS instance is created empty. You must load the client's ERP data (e.g., SAP exports) into the database before the conversational agent can answer queries.
+</Warning>

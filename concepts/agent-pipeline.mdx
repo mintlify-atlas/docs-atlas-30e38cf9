@@ -1,0 +1,342 @@
+---
+title: "Agent Pipeline: Two-Level LangGraph Architecture"
+sidebarTitle: "Agent Pipeline"
+description: "How the outer ConversationGraph and inner SQL pipeline Graph work together to turn natural language into ERP insights, with routing, state, and self-correction."
+---
+
+The ERP Financial Agent is built as two nested LangGraph state machines. The **outer** `ConversationGraph` manages the full dialogue lifecycle — understanding intent, filling slots, clarifying ambiguity, and shaping the final response. When a data query is confirmed, it calls into the **inner** SQL pipeline `Graph`, which links schemas, generates and validates MySQL, executes on a read-only pool, and assembles charts or executive summaries before returning control to the outer layer.
+
+## Two-Level Architecture
+
+```
+ConversationGraph (outer)
+│
+├── understand  ─► clarify? ─► plan ─► execute ──────────────────────────┐
+│                                                                          │
+│   ┌────────────────── Inner SQL Pipeline Graph ◄──────────────────────┐ │
+│   │  router ─► schema_linker ─► sql_generator ─► sql_validator        │ │
+│   │      ├── (fix) error_handler ◄─────────────────────────────┘      │ │
+│   │      └── (execute) hitl_checker ─► sql_executor ─► data_analyst   │ │
+│   │                                              └─► visualizer        │ │
+│   │                 report_writer ◄──────────────────(analysis only)   │ │
+│   │                 response_formatter ─► END                          │ │
+│   └────────────────────────────────────────────────────────────────────┘ │
+│                                                                          │
+└── present ◄── (execution_result) ────────────────────────────────────────┘
+     also: viz_change, forecast, analyze_file, discuss_data, general_respond
+```
+
+---
+
+## Outer Graph: ConversationGraph
+
+Defined in `src/agent/conversation_graph.py`, the outer graph uses `ConversationState` (a plain `dict` for LangGraph flexibility) and contains **10 nodes**.
+
+<Steps>
+  <Step title="understand">
+    Extracts the user's intent and fills a `SlotFrame` (metric, period, dimensions, filters, output format). Classifies `turn_type` as one of: `new_query`, `refine`, `viz_change`, `drill_down`, `forecast`, `file_analysis`, `discuss`, or `general`. Sets `missing_slots` and `confidence` (0.0–1.0).
+  </Step>
+  <Step title="clarify">
+    Fires when `missing_slots` is non-empty. Presents structured clarification options to the user (label/value/description chips). After `max_clarification_rounds`, applies smart defaults and routes onward to `plan` rather than continuing to prompt.
+  </Step>
+  <Step title="plan">
+    Resolves the `SlotFrame` into a concrete `inner_state` (`AgentState` dict) by mapping metric names to tables, applying date range logic, and setting `analysis_intent`. This is the bridge between the outer conversation and the inner SQL graph.
+  </Step>
+  <Step title="execute">
+    Invokes `inner_graph.ainvoke(inner_state)`. Before calling, it copies RBAC fields (`user_id`, `user_role`, `user_permissions`, `user_modules`, `allowed_tables`, `labor_cost_restricted`, `allowed_cebes`) from `ConversationState` into `inner_state` so the SQL validator can enforce data-module access.
+  </Step>
+  <Step title="present">
+    Assembles the final user-facing response from `execution_result`. Generates follow-up suggestion chips (`[{label, query}]`), sets `display_mode` (`text_only`, `table_primary`, `chart_primary`, `chart_only`), and lists any `assumptions` (smart defaults that were applied).
+  </Step>
+  <Step title="viz_change">
+    Skips the entire SQL pipeline. Changes the chart type for already-fetched data and re-renders the ECharts configuration without issuing a new query.
+  </Step>
+  <Step title="forecast">
+    Routes to StatsForecast for time-series projection. Uses historical data from `previous_query_results` to generate forward-looking projections, then hands off to `present`.
+  </Step>
+  <Step title="analyze_file">
+    Handles uploaded Excel/CSV data. Only reachable when `turn_type == "file_analysis"` **and** `file_data` or `file_metadata` is present in state; otherwise falls back to `general_respond` with a helpful upload prompt.
+  </Step>
+  <Step title="general_respond">
+    Answers non-data questions (greetings, capability questions, ERP concepts) using the full conversation history and `session_digest` from long-term memory. No SQL is generated.
+  </Step>
+  <Step title="discuss_data">
+    Interprets or explains data that is already on screen. Uses `previous_query_results`, `previous_kpis`, and `previous_data_summary` from `ConversationState` to answer analytical follow-ups without re-querying.
+  </Step>
+</Steps>
+
+### Outer Routing Conditions
+
+```python
+# After understand: slot-based dispatch
+def _route_after_understand(state: dict) -> str:
+    turn_type = state.get("turn_type", "new_query")
+    missing_slots = state.get("missing_slots", [])
+
+    if missing_slots:
+        return "clarify"
+    if turn_type == "viz_change":
+        return "viz_change"
+    if turn_type == "forecast":
+        return "forecast"
+    if turn_type == "file_analysis":
+        return "analyze_file"   # only if file_data present
+    if turn_type == "discuss":
+        return "discuss_data"
+    if turn_type == "general":
+        return "general_respond"
+    return "plan"  # new_query, refine, drill_down
+
+# After clarify: smart defaults or present clarification
+def _route_after_clarify(state: dict) -> str:
+    if state.get("error") or state.get("execution_result"):
+        return "present"
+    return "plan"   # smart defaults applied → proceed
+```
+
+---
+
+## Inner Graph: SQL Pipeline
+
+Defined in `src/agent/graph.py`, the inner graph uses `AgentState` and contains **13 nodes** operating on structured, typed state.
+
+<Steps>
+  <Step title="router">
+    Classifies the question's `intent` into one of: `query`, `analysis`, `chart`, `follow_up_chart`, `follow_up_analysis`, or `general`. The result drives all subsequent routing.
+  </Step>
+  <Step title="schema_linker">
+    Performs FAISS semantic search over table descriptions embedded with Amazon Titan V2 (1024 dims). Returns the top-k most relevant tables, their DDL-like column context, business rules, join hints, and few-shot query pattern examples. Populates `relevant_tables`, `schema_context`, `join_hints`, and `applicable_rules`.
+  </Step>
+  <Step title="sql_generator">
+    Sends the enriched schema context to Claude (AWS Bedrock) to generate a MySQL query. Uses `metric_context` from the MetricsRegistry as formula hints when business KPIs are detected in the question.
+  </Step>
+  <Step title="sql_validator">
+    Runs five validation layers in sequence using `sqlglot`:
+    1. **Syntax** — parse-level SQL correctness
+    2. **Security** — blocks DDL, DML, multi-statement, and forbidden functions
+    3. **Schema** — verifies referenced tables/columns exist in `relevant_tables`
+    4. **Business rules** — checks ERP-specific constraints (TRM JOIN, `version=0` filter, etc.)
+    5. **RBAC** — enforces `allowed_tables`, `labor_cost_restricted` (hides `COSTOS MANO DE OBRA` accounts), and `allowed_cebes` WHERE injection
+
+    An optional `EXPLAIN` call validates the query plan. Sets `validation_passed`, `validation_errors`, and `validation_warnings`.
+  </Step>
+  <Step title="error_handler">
+    Self-correction loop: receives `validation_errors`, builds a corrective prompt, and re-generates SQL. Tracks `correction_attempt` (max 3 retries). After exhausting retries, routes to `response_formatter` with a graceful error.
+  </Step>
+  <Step title="hitl_checker">
+    Human-in-the-loop gate for expensive or ambiguous queries (e.g., full-table scans, missing date filters). Sets `confirmation_required = True` and provides a `confirmation_message` if the query needs user approval before execution.
+  </Step>
+  <Step title="sql_executor">
+    Executes the validated query on a **read-only** MySQL connection pool (SQLAlchemy async). Returns `query_results` (list of dicts), `column_names`, and `row_count`. Stores results in `previous_query_results` for future follow-up turns.
+  </Step>
+  <Step title="data_analyst">
+    Runs pandas-based analysis over `query_results`. Extracts KPIs (totals, averages, top-N, period-over-period growth), builds a `data_summary`, and sets `analysis_intent` to guide downstream routing.
+  </Step>
+  <Step title="visualizer">
+    Generates an ECharts configuration dict (`chart_config`) for bar, line, pie, treemap, or horizontal bar charts. Selects chart type from `chart_type` in state or infers it from the data shape.
+  </Step>
+  <Step title="report_writer">
+    Only reached when `analysis_intent == "analysis"`. Claude writes an executive summary (`executive_summary`) covering key findings, anomalies, and business recommendations in Spanish.
+  </Step>
+  <Step title="response_formatter">
+    Assembles the final `response` dict from all state fields: SQL, results, KPIs, chart config, executive summary, and cost tracking metadata.
+  </Step>
+  <Step title="follow_up_restore">
+    Multi-turn shortcut: when `intent` is `follow_up_chart` or `follow_up_analysis`, copies `previous_query_results` and `previous_column_names` into the current state so `data_analyst` and `visualizer` can reuse already-fetched data without re-querying.
+  </Step>
+  <Step title="general_response">
+    Handles `intent == "general"` inside the inner graph. Delegates to the same `general_response_node` used by the outer graph.
+  </Step>
+</Steps>
+
+### Inner Routing Conditions
+
+```python
+def _route_by_intent(state: AgentState) -> str:
+    intent = state.get("intent", "query")
+    if intent in ("query", "analysis", "chart"):
+        return "schema_linker"
+    if intent in ("follow_up_chart", "follow_up_analysis"):
+        return "follow_up_restore"
+    return "general_response"
+
+def _route_after_validation(state: AgentState) -> str:
+    if state.get("validation_passed", False):
+        return "execute"          # → hitl_checker
+    errors = state.get("validation_errors", [])
+    has_security_error = any(e.get("error_type") == "security" for e in errors)
+    if has_security_error:
+        return "give_up"          # → response_formatter
+    if state.get("correction_attempt", 0) >= settings.max_correction_attempts:
+        return "give_up"
+    return "fix"                  # → error_handler loop
+
+def _route_after_hitl(state: AgentState) -> str:
+    if state.get("confirmation_required", False):
+        return "wait_confirmation"  # → response_formatter (HITL pause)
+    return "sql_executor"
+
+def _route_after_visualizer(state: AgentState) -> str:
+    if state.get("analysis_intent") == "analysis":
+        return "report_writer"
+    return "response_formatter"
+```
+
+---
+
+## State Shapes
+
+<Tabs>
+  <Tab title="AgentState (inner)">
+    ```python
+    class AgentState(TypedDict, total=False):
+        # Core
+        question: str
+        intent: str           # query | analysis | chart | follow_up_* | general
+        generated_sql: str
+        query_results: list[dict]
+        column_names: list[str]
+        row_count: int
+        response: str
+        error: str
+
+        # Schema intelligence
+        relevant_tables: list[str]
+        schema_context: str
+        few_shot_examples: list[dict]
+        applicable_rules: list[str]
+        join_hints: list[str]
+        metric_context: str   # MetricsRegistry formula hints
+
+        # Validation & self-correction
+        validation_passed: bool
+        validation_errors: list[dict]
+        validation_warnings: list[str]
+        refined_sql: str
+        correction_attempt: int
+
+        # Analysis & visualization
+        analysis_intent: str  # query | analysis
+        kpis: dict
+        data_summary: dict
+        chart_config: dict
+        chart_type: str
+        executive_summary: str
+
+        # HITL & session
+        confirmed: bool
+        confirmation_required: bool
+        confirmation_message: str
+        session_id: str
+
+        # Multi-turn carry-forward
+        conversation_history: list[dict]
+        previous_query_results: list[dict]
+        previous_column_names: list[str]
+        previous_kpis: dict
+
+        # RBAC (injected by execute node from ConversationState)
+        user_id: str
+        user_role: str
+        user_permissions: list[str]
+        user_modules: list[str]
+        allowed_tables: list[str]
+        labor_cost_restricted: bool
+        allowed_cebes: list[str]
+    ```
+  </Tab>
+  <Tab title="ConversationState (outer)">
+    ```python
+    class ConversationState(TypedDict, total=False):
+        # Identity
+        session_id: str
+        user_id: str
+        raw_message: str         # original, unmodified
+        resolved_question: str   # after coreference resolution
+
+        # Turn classification
+        turn_type: str           # new_query | refine | viz_change | ...
+        confidence: float        # 0.0–1.0
+
+        # Slot frame
+        slot_frame: dict         # SlotFrame as dict
+        missing_slots: list[str]
+        clarification_round: int  # max 2
+
+        # Inner graph bridge
+        inner_state: dict        # AgentState mapped from SlotFrame
+        execution_result: dict   # full output from inner graph
+
+        # Presentation
+        response: str
+        suggestions: list[dict]  # [{label, query}] clickable chips
+        display_mode: str        # text_only | table_primary | chart_primary
+        assumptions: list[dict]  # [{field, value, label}]
+
+        # Cross-turn data
+        conversation_history: list[dict]
+        previous_query_results: list[dict]
+        previous_kpis: dict
+
+        # File analysis (Sprint 11)
+        file_id: str
+        file_data: list[dict]
+        file_metadata: dict
+
+        # RBAC (from Cognito via websocket.py)
+        user_role: str
+        user_permissions: list[str]
+        user_modules: list[str]
+        allowed_tables: list[str]
+        labor_cost_restricted: bool
+        allowed_cebes: list[str]
+    ```
+  </Tab>
+  <Tab title="SlotFrame">
+    ```python
+    class SlotFrame(TypedDict, total=False):
+        # Required — system clarifies if missing & confidence is low
+        metric: str    # "ingresos", "costos", "margen", "EBITDA", "nomina"
+        period: str    # "202401" | "202401-202412" | "LATEST"
+
+        # Optional — smart defaults applied if absent
+        dimensions: list[str]    # ["centro_beneficio", "material"]
+        filters: list[dict]      # [{"column": "sociedad", "op": "=", "value": "1000"}]
+        output_format: str       # table | chart | analysis | export (default: table)
+        chart_type: str          # bar | line | pie | treemap | horizontal_bar
+        limit: int               # default: 50
+
+        # Derived — filled by schema_linker
+        tables: list[str]
+        query_pattern: str       # P1–P10
+
+        # Context-inherited — carried from previous turns
+        previous_sql: str
+        previous_tables: list[str]
+        previous_filters: list[dict]
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Key Design Decisions
+
+<CardGroup cols={2}>
+  <Card title="Fail-closed Security" icon="shield">
+    Any SQL containing DDL, DML, multi-statement constructs, or referencing tables outside the principal's `allowed_tables` is rejected immediately — no retries for security errors.
+  </Card>
+  <Card title="Max 3 Self-Corrections" icon="arrow-rotate-left">
+    The `error_handler → sql_validator` loop is capped at `max_correction_attempts` (default 3). Exceeding this routes to `response_formatter` with a transparent error rather than looping indefinitely.
+  </Card>
+  <Card title="RBAC Propagation" icon="lock">
+    RBAC context is resolved once per WebSocket connection and injected into both `ConversationState` and `AgentState` by the `execute` node. SQL validation enforces module-level table access and row-level `centro_beneficio` filtering.
+  </Card>
+  <Card title="Follow-up Without Re-query" icon="database">
+    `follow_up_restore` lets users request "show as pie chart" or "analyze this deeper" without burning another SQL round-trip — the previous results are reloaded from state and routed directly to `data_analyst`.
+  </Card>
+</CardGroup>
+
+<Note>
+  The outer graph uses `StateGraph(dict)` (plain dict) instead of a typed class because `TypedDict` is not serializable in LangGraph's checkpoint store. The inner graph uses the strongly-typed `AgentState(TypedDict)` because it does not need cross-turn persistence.
+</Note>
